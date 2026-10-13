@@ -1,18 +1,22 @@
 //! Multi-agent orchestrator.
 //!
 //! ```text
-//!  user ─► Router ─┬─ chat ──────────────► Assistant ─► answer
-//!                  └─ build ─► Planner ─► Builder ⇄ tools (scene)
-//!                                           │  └─ ask_coder ─► Coder ─► set_script
-//!                                           ▼
-//!                                        Reviewer ─► (fixes → Builder) ─► summary
+//!               ┌──────── Agent Memory (TencentDB Agent Memory / built-in) ───────┐
+//!               │ recall before the run                     store after the run │
+//!  user ─► Router ─┬─ Ask ───────► Assistant ⇄ web_search / fetch_url / memory ─► answer
+//!                  ├─ Fast ──────────────────► Builder ⇄ scene + web + memory tools
+//!                  └─ Planning ─► Planner ─► Builder ⇄ tools ─► (ask_coder ─► Coder)
+//!                                                  └──► Reviewer ─► fixes ─► Builder
 //! ```
 //! Agents run on a worker thread; scene tools execute on the UI thread through
-//! `AgentEvent::Tool` + a reply channel, so the scene never needs locking.
+//! `AgentEvent::Tool` + a reply channel, so the scene never needs locking. Web, memory and
+//! coder tools run directly on the worker thread.
 
 use super::client::{stream_chat, Msg};
+use super::memory::{Memory, MemoryConfig};
 use super::models::{self, Endpoint};
 use super::tools::{self, ToolCall, SCRIPT_DOCS, TOOL_DOCS};
+use super::web::{self, SearchHit};
 use crate::config::Settings;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -20,7 +24,7 @@ use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    Router,
+    Explore,
     Assistant,
     Planner,
     Builder,
@@ -29,19 +33,9 @@ pub enum Role {
 }
 
 impl Role {
-    pub fn label(self) -> &'static str {
-        match self {
-            Role::Router => "Router",
-            Role::Assistant => "Forge AI",
-            Role::Planner => "Planner",
-            Role::Builder => "Builder",
-            Role::Coder => "Coder",
-            Role::Reviewer => "Reviewer",
-        }
-    }
     pub fn icon(self) -> &'static str {
         match self {
-            Role::Router => "🧭",
+            Role::Explore => "🔭",
             Role::Assistant => "✨",
             Role::Planner => "🗺",
             Role::Builder => "🔨",
@@ -52,21 +46,69 @@ impl Role {
 }
 
 pub enum AgentEvent {
-    Start { role: Role, model: String },
-    Delta { text: String },
-    End { model: String },
-    Tool { call: ToolCall, reply: Sender<Result<String, String>> },
+    Start {
+        role: Role,
+        model: String,
+    },
+    Delta {
+        text: String,
+    },
+    End {
+        model: String,
+    },
+    Tool {
+        call: ToolCall,
+        reply: Sender<Result<String, String>>,
+    },
+    /// A tool that ran on the worker (web, memory, coder) — for display only.
+    ToolDone {
+        call: ToolCall,
+        result: Result<String, String>,
+    },
+    Sources(Vec<SearchHit>),
+    Todos(Vec<(String, String)>),
+    Compacted(String),
+    Memories(Vec<String>),
     Info(String),
     Error(String),
     Done,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize, Default)]
 pub enum Mode {
-    /// Agents may edit the scene.
-    Agent,
-    /// Plain Q&A, no tools.
+    /// Planner → Builder (→ Reviewer): best for bigger tasks.
+    #[default]
+    Planning,
+    /// Builder only: quick edits.
+    Fast,
+    /// Q&A — no scene edits (web + memory tools still available).
     Ask,
+}
+
+impl Mode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Mode::Planning => crate::i18n::t("Planning", "Planlama"),
+            Mode::Fast => crate::i18n::t("Fast", "Hızlı"),
+            Mode::Ask => crate::i18n::t("Ask", "Sor"),
+        }
+    }
+    pub fn hint(self) -> &'static str {
+        match self {
+            Mode::Planning => crate::i18n::t(
+                "Agent plans before building. Use for bigger tasks.",
+                "Ajan önce plan yapar. Büyük işler için.",
+            ),
+            Mode::Fast => crate::i18n::t(
+                "Agent edits the scene directly. Use for quick changes.",
+                "Ajan sahneyi doğrudan düzenler. Hızlı değişiklikler için.",
+            ),
+            Mode::Ask => crate::i18n::t(
+                "Answers questions; never edits the scene.",
+                "Soruları yanıtlar; sahneyi değiştirmez.",
+            ),
+        }
+    }
 }
 
 pub struct Job {
@@ -77,6 +119,11 @@ pub struct Job {
     pub selected: Option<String>,
     pub settings: Settings,
     pub openrouter_key: String,
+    pub web: bool,
+    pub memory: MemoryConfig,
+    pub session_id: String,
+    /// Summary of older turns (opencode-style compaction).
+    pub summary: String,
 }
 
 pub struct AgentHandle {
@@ -91,10 +138,20 @@ pub fn spawn(job: Job, ctx: egui::Context) -> AgentHandle {
     std::thread::Builder::new()
         .name("forge-agent".into())
         .spawn(move || {
-            let mut o = Orchestrator { job, tx: tx.clone(), cancel: c2, ctx: ctx.clone() };
+            let memory = Memory::new(job.memory.clone());
+            let mut o = Orchestrator {
+                job,
+                tx: tx.clone(),
+                cancel: c2,
+                ctx: ctx.clone(),
+                memory,
+                memories: String::new(),
+                last_answer: String::new(),
+            };
             if let Err(e) = o.run() {
                 let _ = tx.send(AgentEvent::Error(e));
             }
+            o.persist();
             let _ = tx.send(AgentEvent::Done);
             ctx.request_repaint();
         })
@@ -107,10 +164,44 @@ struct Orchestrator {
     tx: Sender<AgentEvent>,
     cancel: Arc<AtomicBool>,
     ctx: egui::Context,
+    memory: Memory,
+    memories: String,
+    last_answer: String,
 }
 
-const PERSONA: &str = "You are Forge AI, the built-in assistant of the Forge game engine (an AI-native alternative to Unity, written in Rust). \
+const PERSONA: &str = "You are Forge AI, the built-in agent of the Forge game engine (an open-source, AI-native alternative to Unity / Unreal, written in Rust). \
 Always answer in the same language the user writes in (e.g. Turkish → Turkish). Be concise and practical.";
+
+const ASK_TOOLS: &str = r##"## Tools
+You may call tools with fenced blocks (one JSON object per block), then STOP and wait for results:
+```tool
+{"tool": "web_search", "args": {"query": "rust ecs tutorial"}}
+```
+- web_search {query} → web results searched from the user's device. Use it for current facts, docs, assets, tutorials.
+- fetch_url {url} → readable text of a page (read the best result before answering).
+- memory_search {query} → the user's long-term memories.
+- remember {fact} → save a durable preference/fact.
+- get_scene {} · list_files {path} · read_file {path} · grep {pattern} → inspect the scene and project files (read-only).
+- task {agent: "explore", prompt} → delegate a research sub-task to the Explore subagent.
+When you have enough information, answer WITHOUT tool blocks and cite sources as markdown links.
+"##;
+
+/// Tools an agent may use without changing anything (Ask mode / Explore subagent).
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    "web_search",
+    "fetch_url",
+    "memory_search",
+    "remember",
+    "get_scene",
+    "list_files",
+    "read_file",
+    "grep",
+    "task",
+    "todo_write",
+];
+
+const EXPLORE_PROMPT: &str = "You are the EXPLORE subagent of the Forge engine: a search specialist. Your role is EXCLUSIVELY to search and analyze \
+(scene, project files, the web, memory). You MUST NOT modify anything. Return a concise report with the facts, names and links the caller needs.";
 
 impl Orchestrator {
     fn send(&self, e: AgentEvent) {
@@ -125,84 +216,260 @@ impl Orchestrator {
             Role::Builder => &s.builder_model,
             Role::Reviewer => &s.reviewer_model,
             Role::Coder => &s.coder_model,
-            Role::Router => &s.router_model,
+            Role::Explore => &s.router_model,
             _ => &s.selected_model,
         };
-        if o.trim().is_empty() { s.selected_model.clone() } else { o.clone() }
+        if o.trim().is_empty() {
+            s.selected_model.clone()
+        } else {
+            o.clone()
+        }
     }
 
     fn endpoint(&self, role: Role) -> Endpoint {
-        models::resolve(&self.model_for(role), &self.job.settings, &self.job.openrouter_key)
+        models::resolve(
+            &self.model_for(role),
+            &self.job.settings,
+            &self.job.openrouter_key,
+        )
     }
 
-    /// One streamed LLM turn for `role`. Falls back to the Auto router once if the chosen model fails.
-    fn call(&self, role: Role, messages: &[Msg]) -> Result<String, String> {
+    /// One streamed LLM turn for `role`. Falls back to Auto once if the chosen cloud model fails.
+    fn call(&mut self, role: Role, messages: &[Msg]) -> Result<String, String> {
         if self.cancel.load(Ordering::Relaxed) {
             return Err("Cancelled".into());
         }
         let ep = self.endpoint(role);
-        self.send(AgentEvent::Start { role, model: models::display_name(&ep.model) });
+        self.send(AgentEvent::Start {
+            role,
+            model: models::display_name(&ep.model),
+        });
         let tx = self.tx.clone();
         let ctx = self.ctx.clone();
         let emit = move |d: &str| {
-            let _ = tx.send(AgentEvent::Delta { text: d.to_string() });
+            let _ = tx.send(AgentEvent::Delta {
+                text: d.to_string(),
+            });
             ctx.request_repaint();
         };
         let t = self.job.settings.temperature;
-        match stream_chat(&ep, messages, t, &self.cancel, emit.clone()) {
-            Ok(r) => {
-                self.send(AgentEvent::End { model: r.model });
-                Ok(r.text)
-            }
-            Err(e) if e != "Cancelled" && ep.model != models::AUTO_ID && ep.backend == models::Backend::OpenRouter => {
-                self.send(AgentEvent::Info(format!("{} failed ({e}) — retrying with Auto", models::display_name(&ep.model))));
+        let r = match stream_chat(&ep, messages, t, &self.cancel, emit.clone()) {
+            Ok(r) => Ok(r),
+            Err(e)
+                if e != "Cancelled"
+                    && ep.model != models::AUTO_ID
+                    && ep.backend == models::Backend::OpenRouter =>
+            {
+                self.send(AgentEvent::Info(format!(
+                    "{} -> Auto ({e})",
+                    models::display_name(&ep.model)
+                )));
                 let mut fb = ep.clone();
                 fb.model = models::AUTO_ID.into();
-                let r = stream_chat(&fb, messages, t, &self.cancel, emit)?;
+                stream_chat(&fb, messages, t, &self.cancel, emit)
+            }
+            Err(e) => Err(e),
+        };
+        match r {
+            Ok(r) => {
                 self.send(AgentEvent::End { model: r.model });
+                self.last_answer = tools::strip_tool_blocks(&r.text);
                 Ok(r.text)
             }
             Err(e) => {
-                self.send(AgentEvent::End { model: String::new() });
+                self.send(AgentEvent::End {
+                    model: String::new(),
+                });
                 Err(e)
             }
         }
     }
 
-    /// Run a tool on the UI thread and wait for its result.
-    fn tool(&self, call: ToolCall) -> Result<String, String> {
+    /// Run a scene tool on the UI thread and wait for its result.
+    fn ui_tool(&self, call: ToolCall) -> Result<String, String> {
         let (rtx, rrx) = channel();
         self.send(AgentEvent::Tool { call, reply: rtx });
         rrx.recv().map_err(|_| "editor closed".to_string())?
     }
 
+    /// Dispatch any tool: worker-side tools here, scene tools on the UI thread.
+    fn tool(&mut self, call: &ToolCall) -> Result<String, String> {
+        let worker = matches!(
+            call.name.as_str(),
+            "web_search"
+                | "fetch_url"
+                | "memory_search"
+                | "remember"
+                | "ask_coder"
+                | "task"
+                | "todo_write"
+        );
+        if !worker {
+            return self.ui_tool(call.clone());
+        }
+        let arg = |k: &str| {
+            call.args
+                .get(k)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let r = match call.name.as_str() {
+            "web_search" if !self.job.web => {
+                Err("web access is disabled in the Agent panel (🌐)".into())
+            }
+            "fetch_url" if !self.job.web => {
+                Err("web access is disabled in the Agent panel (🌐)".into())
+            }
+            "web_search" => web::search(&arg("query"), 6).map(|hits| {
+                self.send(AgentEvent::Sources(hits.clone()));
+                serde_json::to_string_pretty(&hits).unwrap_or_default()
+            }),
+            "fetch_url" => web::fetch_text(&arg("url"), 6000),
+            "memory_search" => {
+                let items = self.memory.recall(&arg("query"));
+                Ok(if items.is_empty() {
+                    "no memories found".into()
+                } else {
+                    items
+                        .iter()
+                        .map(|m| format!("- [{}] {}", m.kind, m.text))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            }
+            "remember" => self
+                .memory
+                .remember(&self.job.session_id, &arg("fact"))
+                .map(|_| "stored".into()),
+            "ask_coder" => self.coder(call),
+            "task" => self.subagent(&arg("agent"), &arg("prompt")),
+            "todo_write" => {
+                let todos: Vec<(String, String)> = call.args["todos"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .map(|t| {
+                                (
+                                    t["content"]
+                                        .as_str()
+                                        .or(t["text"].as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                    t["status"].as_str().unwrap_or("pending").to_string(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let n = todos.len();
+                self.send(AgentEvent::Todos(todos));
+                Ok(format!("{n} todos tracked"))
+            }
+            _ => unreachable!(),
+        };
+        self.send(AgentEvent::ToolDone {
+            call: call.clone(),
+            result: r.clone(),
+        });
+        r
+    }
+
     fn context_block(&self) -> String {
-        let mut s = format!("Current scene: {}", self.job.scene_json);
+        let mut s = String::new();
+        if self.job.mode != Mode::Ask || !self.job.scene_json.is_empty() {
+            s.push_str(&format!("Current scene: {}", self.job.scene_json));
+        }
         if let Some(sel) = &self.job.selected {
             s.push_str(&format!("\nSelected entity: {sel}"));
+        }
+        if !self.job.summary.is_empty() {
+            s.push_str(&format!(
+                "\n\nSummary of the earlier conversation:\n{}",
+                self.job.summary
+            ));
+        }
+        if !self.memories.is_empty() {
+            s.push_str(&format!("\n\nRelevant long-term memories about this user/project (use them, don't repeat them verbatim):\n{}", self.memories));
+        }
+        if !self.job.web {
+            s.push_str("\n\nWeb access is OFF: do not call web_search or fetch_url.");
         }
         s
     }
 
+    fn recall(&mut self) {
+        let items = self.memory.recall(&self.job.prompt);
+        if !items.is_empty() {
+            self.memories = items
+                .iter()
+                .map(|m| format!("- {}", m.text.replace('\n', " ")))
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.send(AgentEvent::Memories(
+                items.into_iter().map(|m| m.text).collect(),
+            ));
+        }
+    }
+
+    fn persist(&self) {
+        if !self.last_answer.trim().is_empty() || !self.job.prompt.is_empty() {
+            if let Err(e) =
+                self.memory
+                    .store_turn(&self.job.session_id, &self.job.prompt, &self.last_answer)
+            {
+                let _ = self.tx.send(AgentEvent::Info(format!("memory: {e}")));
+            }
+        }
+    }
+
+    /// opencode-style compaction: fold old turns into a short summary once the history grows.
+    fn compact(&mut self) {
+        let chars: usize = self.job.history.iter().map(|m| m.content.len()).sum();
+        if self.job.history.len() <= 8 && chars < 12_000 {
+            return;
+        }
+        let keep = 4.min(self.job.history.len());
+        let old: Vec<Msg> = self
+            .job
+            .history
+            .drain(..self.job.history.len() - keep)
+            .collect();
+        let transcript: String = old
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}: {}\n",
+                    m.role,
+                    m.content.chars().take(2000).collect::<String>()
+                )
+            })
+            .collect();
+        let msgs = vec![
+            Msg::system("Summarize what was done in this conversation, like a pull request description. 3-6 sentences. Keep names of entities, files, decisions and open questions. Same language as the conversation."),
+            Msg::user(format!("{}\n\n{transcript}", self.job.summary)),
+        ];
+        let saved = self.last_answer.clone();
+        if let Ok(sum) = self.call(Role::Assistant, &msgs) {
+            self.job.summary = sum.clone();
+            self.send(AgentEvent::Compacted(sum));
+        }
+        self.last_answer = saved;
+    }
+
     fn run(&mut self) -> Result<(), String> {
-        let wants_build = self.job.mode == Mode::Agent && self.route()?;
-        if !wants_build {
-            let mut msgs = vec![Msg::system(format!(
-                "{PERSONA}\nYou can explain Forge features, game design, and Rhai scripting.\n{SCRIPT_DOCS}\n{}",
-                self.context_block()
-            ))];
-            msgs.extend(self.job.history.iter().cloned());
-            msgs.push(Msg::user(&self.job.prompt));
-            self.call(Role::Assistant, &msgs)?;
-            return Ok(());
+        self.recall();
+        self.compact();
+        if self.job.mode == Mode::Ask {
+            return self.ask();
         }
 
         // 1. Plan
-        let plan = if self.job.settings.use_planner {
+        let plan = if self.job.mode == Mode::Planning && self.job.settings.use_planner {
             let msgs = vec![
                 Msg::system(format!(
                     "{PERSONA}\nYou are the PLANNER agent. Turn the user's request into a short numbered build plan (3-8 steps) \
-                     for the Builder agent who edits the scene with tools (entities, transforms, colors, rigidbodies, cameras, Rhai scripts). \
+                     for the Builder agent who edits the scene with tools (entities, transforms, materials, lights, rigidbodies, cameras, Rhai scripts, web research). \
                      Include concrete positions/sizes/colors where useful and which entities need scripts. Do not write code or tool calls.\n{}",
                     self.context_block()
                 )),
@@ -215,15 +482,17 @@ impl Orchestrator {
 
         // 2. Build (+ optional review round)
         let mut feedback: Option<String> = None;
-        let rounds = if self.job.settings.use_reviewer { 2 } else { 1 };
+        let review = self.job.mode == Mode::Planning && self.job.settings.use_reviewer;
+        let rounds = if review { 2 } else { 1 };
         for round in 0..rounds {
-            let summary = self.build(plan.as_deref(), feedback.as_deref())?;
-            if !self.job.settings.use_reviewer || round + 1 == rounds {
-                let _ = summary;
+            self.build(plan.as_deref(), feedback.as_deref())?;
+            if !review || round + 1 == rounds {
                 break;
             }
-            // 3. Review
-            let scene_now = self.tool(ToolCall { name: "get_scene".into(), args: serde_json::json!({}) })?;
+            let scene_now = self.ui_tool(ToolCall {
+                name: "get_scene".into(),
+                args: serde_json::json!({}),
+            })?;
             let msgs = vec![
                 Msg::system(format!(
                     "{PERSONA}\nYou are the REVIEWER agent. Check whether the scene satisfies the user's request. \
@@ -233,7 +502,11 @@ impl Orchestrator {
                 Msg::user(format!("Request: {}\n\nScene now: {scene_now}", self.job.prompt)),
             ];
             let verdict = self.call(Role::Reviewer, &msgs)?;
-            if verdict.trim_start().to_ascii_uppercase().starts_with("APPROVED") {
+            if verdict
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with("APPROVED")
+            {
                 break;
             }
             feedback = Some(verdict);
@@ -241,42 +514,52 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// Router: cheap heuristic, or an LLM decision when a router model is configured (e.g. Mercury Decide).
-    fn route(&self) -> Result<bool, String> {
-        let p = self.job.prompt.to_lowercase();
-        let build_words = [
-            "create", "make", "build", "add", "spawn", "place", "move", "delete", "remove", "change", "set", "color", "script",
-            "level", "game", "scene", "player", "enemy", "rotate", "scale", "generate", "fix", "duplicate", "camera",
-            "oluştur", "olustur", "yap", "ekle", "koy", "taşı", "tasi", "sil", "değiştir", "degistir", "renk", "boya", "seviye",
-            "oyun", "sahne", "oyuncu", "düşman", "dusman", "döndür", "büyüt", "küçült", "kur", "yerleştir", "kamera", "zıpla",
-            "hareket", "düzelt", "kopyala", "platform", "harita", "bölüm",
-        ];
-        let question = p.trim_end().ends_with('?')
-            && !build_words.iter().take(12).any(|w| p.starts_with(w));
-        let heuristic = build_words.iter().any(|w| p.contains(w)) && !(question && p.len() < 60);
-        if self.job.settings.router_model.trim().is_empty() {
-            return Ok(heuristic);
+    /// Ask mode: a small tool loop with web + memory tools only.
+    fn ask(&mut self) -> Result<(), String> {
+        let mut msgs = vec![Msg::system(format!(
+            "{PERSONA}\nYou can explain Forge features, game design, and Rhai scripting.\n{SCRIPT_DOCS}\n{ASK_TOOLS}\n{}",
+            self.context_block()
+        ))];
+        msgs.extend(self.job.history.iter().cloned());
+        msgs.push(Msg::user(&self.job.prompt));
+        for _ in 0..5 {
+            let reply = self.call(Role::Assistant, &msgs)?;
+            let calls: Vec<ToolCall> = tools::parse_tool_calls(&reply)
+                .into_iter()
+                .filter(|c| READ_ONLY_TOOLS.contains(&c.name.as_str()))
+                .collect();
+            if calls.is_empty() {
+                return Ok(());
+            }
+            let results = self.run_calls(&calls)?;
+            msgs.push(Msg::assistant(reply));
+            msgs.push(Msg::user(format!("Tool results:\n{results}")));
         }
-        let msgs = vec![
-            Msg::system(
-                "Classify the user's message for a game-engine assistant. Answer with exactly one word: \
-                 BUILD if it asks to create/modify/delete anything in the scene or game (objects, levels, scripts, cameras), \
-                 CHAT if it is a question or conversation.",
-            ),
-            Msg::user(&self.job.prompt),
-        ];
-        match self.call(Role::Router, &msgs) {
-            Ok(r) => Ok(r.to_ascii_uppercase().contains("BUILD")),
-            Err(_) => Ok(heuristic),
-        }
+        Ok(())
     }
 
-    fn build(&self, plan: Option<&str>, feedback: Option<&str>) -> Result<String, String> {
+    fn run_calls(&mut self, calls: &[ToolCall]) -> Result<String, String> {
+        let mut results = String::new();
+        for call in calls {
+            if self.cancel.load(Ordering::Relaxed) {
+                return Err("Cancelled".into());
+            }
+            let line = match self.tool(call) {
+                Ok(s) => format!("✔ {}: {}", call.name, truncate(&s, 4000)),
+                Err(e) => format!("✖ {}: ERROR {e}", call.name),
+            };
+            results.push_str(&line);
+            results.push('\n');
+        }
+        Ok(results)
+    }
+
+    fn build(&mut self, plan: Option<&str>, feedback: Option<&str>) -> Result<String, String> {
         let mut msgs = vec![Msg::system(format!(
             "{PERSONA}\nYou are the BUILDER agent. You edit the open scene ONLY through tools.\n{TOOL_DOCS}\n{SCRIPT_DOCS}\n\
              Work efficiently: batch with create_many, give every entity a clear unique name, keep things on the ground, \
-             add a Main Camera that frames the action (follow the player for games). For gameplay logic you may write scripts \
-             yourself with set_script or delegate with ask_coder.\n{}",
+             use materials and lights to make scenes look good, add a Main Camera that frames the action (follow the player for games). \
+             For gameplay logic write scripts with set_script or delegate with ask_coder. Use web_search when you need outside knowledge.\n{}",
             self.context_block()
         ))];
         msgs.extend(self.job.history.iter().cloned());
@@ -296,34 +579,70 @@ impl Orchestrator {
             if calls.is_empty() {
                 return Ok(reply);
             }
-            let mut results = String::new();
-            for call in calls {
-                if self.cancel.load(Ordering::Relaxed) {
-                    return Err("Cancelled".into());
-                }
-                let r = if call.name == "ask_coder" {
-                    self.coder(&call)
-                } else {
-                    self.tool(call.clone())
-                };
-                let line = match r {
-                    Ok(s) => format!("✔ {}: {}", call.name, truncate(&s, 1800)),
-                    Err(e) => format!("✘ {}: ERROR {e}", call.name),
-                };
-                results.push_str(&line);
-                results.push('\n');
-            }
+            let results = self.run_calls(&calls)?;
             msgs.push(Msg::assistant(reply));
-            let nudge = if step + 2 >= max { "\nYou are almost out of steps: finish now and summarize." } else { "" };
+            let nudge = if step + 2 >= max {
+                "\nYou are almost out of steps: finish now and summarize."
+            } else {
+                ""
+            };
             msgs.push(Msg::user(format!("Tool results:\n{results}{nudge}")));
         }
         Ok(String::new())
     }
 
+    /// Generic subagent loop (opencode `task` tool): `explore` is read-only, `coder` may write scripts.
+    fn subagent(&mut self, agent: &str, prompt: &str) -> Result<String, String> {
+        let (role, system, allowed): (Role, String, Vec<&str>) = match agent {
+            "coder" | "code" => (
+                Role::Coder,
+                format!("You are the CODER subagent of the Forge engine. Write and fix Rhai gameplay scripts.\n{SCRIPT_DOCS}\n{TOOL_DOCS}\nOnly use: get_scene, read_file, list_files, grep, write_file, set_script. Finish with a short report."),
+                vec!["get_scene", "read_file", "list_files", "grep", "write_file", "set_script"],
+            ),
+            _ => (Role::Explore, format!("{EXPLORE_PROMPT}\n{ASK_TOOLS}"), READ_ONLY_TOOLS.iter().copied().filter(|t| *t != "task").collect()),
+        };
+        let saved = self.last_answer.clone();
+        let mut msgs = vec![
+            Msg::system(format!("{system}\nScene: {}", self.job.scene_json)),
+            Msg::user(prompt),
+        ];
+        let mut report = String::new();
+        for _ in 0..6 {
+            let reply = self.call(role, &msgs)?;
+            let calls: Vec<ToolCall> = tools::parse_tool_calls(&reply)
+                .into_iter()
+                .filter(|c| allowed.contains(&c.name.as_str()))
+                .collect();
+            if calls.is_empty() {
+                report = tools::strip_tool_blocks(&reply);
+                break;
+            }
+            let results = self.run_calls(&calls)?;
+            msgs.push(Msg::assistant(reply));
+            msgs.push(Msg::user(format!("Tool results:\n{results}")));
+        }
+        self.last_answer = saved;
+        Ok(if report.is_empty() {
+            "subagent finished without a report".into()
+        } else {
+            report
+        })
+    }
+
     /// Coder sub-agent: writes a Rhai script for one entity, validates it, retries once on compile errors.
-    fn coder(&self, call: &ToolCall) -> Result<String, String> {
-        let target = call.args.get("target").and_then(|t| t.as_str()).unwrap_or_default().to_string();
-        let goal = call.args.get("goal").and_then(|t| t.as_str()).unwrap_or_default().to_string();
+    fn coder(&mut self, call: &ToolCall) -> Result<String, String> {
+        let target = call
+            .args
+            .get("target")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let goal = call
+            .args
+            .get("goal")
+            .and_then(|t| t.as_str())
+            .unwrap_or_default()
+            .to_string();
         let mut msgs = vec![
             Msg::system(format!(
                 "You are the CODER agent of the Forge engine. Write a Rhai script for one entity.\n{SCRIPT_DOCS}\n\
@@ -331,22 +650,27 @@ impl Orchestrator {
             )),
             Msg::user(format!("Entity: {target}\nGoal: {goal}\nScene: {}", self.job.scene_json)),
         ];
+        let saved = self.last_answer.clone();
         for _ in 0..2 {
             let reply = self.call(Role::Coder, &msgs)?;
             let code = extract_code(&reply);
             match rhai::Engine::new().compile(&code) {
                 Ok(_) => {
-                    return self.tool(ToolCall {
+                    self.last_answer = saved;
+                    return self.ui_tool(ToolCall {
                         name: "set_script".into(),
                         args: serde_json::json!({"target": target, "code": code}),
                     });
                 }
                 Err(e) => {
                     msgs.push(Msg::assistant(reply));
-                    msgs.push(Msg::user(format!("Compile error: {e}. Fix it and reply with the full corrected script.")));
+                    msgs.push(Msg::user(format!(
+                        "Compile error: {e}. Fix it and reply with the full corrected script."
+                    )));
                 }
             }
         }
+        self.last_answer = saved;
         Err("coder could not produce a compiling script".into())
     }
 }

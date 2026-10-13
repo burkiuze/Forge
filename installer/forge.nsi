@@ -3,6 +3,7 @@ Unicode true
 !include "MUI2.nsh"
 !include "nsDialogs.nsh"
 !include "LogicLib.nsh"
+!include "FileFunc.nsh"
 
 !ifndef VERSION
   !define VERSION "0.1.0"
@@ -12,7 +13,7 @@ Unicode true
 !endif
 
 Name "Forge ${VERSION}"
-OutFile "..\dist\Forge-Setup-${VERSION}.exe"
+OutFile "..\dist\Forge-Setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\Forge"
 InstallDirRegKey HKCU "Software\Forge" "InstallDir"
 RequestExecutionLevel user
@@ -52,7 +53,20 @@ LangString KeyBody ${LANG_TURKISH} "Anahtar yalnızca bu bilgisayarda %APPDATA%\
 LangString KeyBody ${LANG_ENGLISH} "The key is stored only on this PC in %APPDATA%\Forge\.env. Leave it empty and Forge will ask in its first-run wizard."
 
 Function .onInit
+  ; Silent mode = self-update from inside Forge: give the old process time to exit.
+  IfSilent 0 +3
+    Sleep 2500
+    Goto done
   !insertmacro MUI_LANGDLL_DISPLAY
+  done:
+FunctionEnd
+
+Function .onInstSuccess
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/RUN" $R1
+  IfErrors +2
+    Exec '"$INSTDIR\Forge.exe"'
 FunctionEnd
 
 Function KeyPage
@@ -85,7 +99,14 @@ FunctionEnd
 Section "Forge (gerekli / required)" SecCore
   SectionIn RO
   SetOutPath "$INSTDIR"
+  SetOverwrite try
+  ClearErrors
   File /oname=Forge.exe "${EXE}"
+  IfErrors 0 +4
+    Sleep 3000
+    ClearErrors
+    File /oname=Forge.exe "${EXE}"
+  SetOverwrite on
   File "..\assets\forge.ico"
   File /oname=LICENSE.txt "..\LICENSE"
   File /oname=README.md "..\README.md"

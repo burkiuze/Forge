@@ -13,9 +13,24 @@ pub struct Msg {
 }
 
 impl Msg {
-    pub fn system(c: impl Into<String>) -> Self { Self { role: "system", content: c.into() } }
-    pub fn user(c: impl Into<String>) -> Self { Self { role: "user", content: c.into() } }
-    pub fn assistant(c: impl Into<String>) -> Self { Self { role: "assistant", content: c.into() } }
+    pub fn system(c: impl Into<String>) -> Self {
+        Self {
+            role: "system",
+            content: c.into(),
+        }
+    }
+    pub fn user(c: impl Into<String>) -> Self {
+        Self {
+            role: "user",
+            content: c.into(),
+        }
+    }
+    pub fn assistant(c: impl Into<String>) -> Self {
+        Self {
+            role: "assistant",
+            content: c.into(),
+        }
+    }
 }
 
 pub struct Reply {
@@ -40,9 +55,15 @@ pub fn stream_chat(
     mut on_delta: impl FnMut(&str),
 ) -> Result<Reply, String> {
     if ep.backend == super::models::Backend::OpenRouter && ep.key.trim().is_empty() {
-        return Err("OpenRouter API key missing — set it in AI ▸ Settings (or OPENROUTER_API_KEY in .env).".into());
+        return Err(
+            "OpenRouter API key missing — set it in AI › Settings (or OPENROUTER_API_KEY in .env)."
+                .into(),
+        );
     }
-    let msgs: Vec<Value> = messages.iter().map(|m| json!({"role": m.role, "content": m.content})).collect();
+    let msgs: Vec<Value> = messages
+        .iter()
+        .map(|m| json!({"role": m.role, "content": m.content}))
+        .collect();
     let body = json!({
         "model": ep.model,
         "messages": msgs,
@@ -78,14 +99,21 @@ pub fn stream_chat(
             return Err("Cancelled".into());
         }
         let line = line.map_err(|e| format!("Stream error: {e}"))?;
-        let Some(data) = line.strip_prefix("data:") else { continue };
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
         let data = data.trim();
         if data == "[DONE]" {
             break;
         }
-        let Ok(v) = serde_json::from_str::<Value>(data) else { continue };
+        let Ok(v) = serde_json::from_str::<Value>(data) else {
+            continue;
+        };
         if let Some(err) = v.get("error") {
-            return Err(err["message"].as_str().unwrap_or("provider error").to_string());
+            return Err(err["message"]
+                .as_str()
+                .unwrap_or("provider error")
+                .to_string());
         }
         if let Some(m) = v["model"].as_str() {
             model = m.to_string();
@@ -98,7 +126,9 @@ pub fn stream_chat(
         }
     }
     if text.trim().is_empty() {
-        return Err("Model returned an empty reply (it may be rate-limited — try another model).".into());
+        return Err(
+            "Model returned an empty reply (it may be rate-limited — try another model).".into(),
+        );
     }
     Ok(Reply { text, model })
 }
@@ -114,7 +144,10 @@ pub fn check_openrouter_key(key: &str) -> Result<String, String> {
             let v: Value = r.into_json().map_err(|e| e.to_string())?;
             let label = v["data"]["label"].as_str().unwrap_or("key");
             let free = v["data"]["is_free_tier"].as_bool().unwrap_or(false);
-            Ok(format!("OK · {label}{}", if free { " · free tier" } else { "" }))
+            Ok(format!(
+                "OK · {label}{}",
+                if free { " · free tier" } else { "" }
+            ))
         }
         Err(ureq::Error::Status(c, _)) => Err(format!("Rejected (HTTP {c})")),
         Err(e) => Err(e.to_string()),

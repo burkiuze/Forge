@@ -12,7 +12,10 @@ fn parses_tool_blocks() {
     assert_eq!(calls.len(), 3);
     assert_eq!(calls[0].name, "create_entity");
     assert_eq!(calls[2].args["target"], "A");
-    assert_eq!(strip_tool_blocks(text).lines().next(), Some("Building now."));
+    assert_eq!(
+        strip_tool_blocks(text).lines().next(),
+        Some("Building now.")
+    );
 }
 
 #[test]
@@ -24,7 +27,10 @@ fn bare_json_line_is_a_call() {
 #[test]
 fn tools_edit_scene() {
     let mut s = Scene::starter();
-    let call = |name: &str, args| ToolCall { name: name.into(), args };
+    let call = |name: &str, args| ToolCall {
+        name: name.into(),
+        args,
+    };
     execute(&mut s, &call("create_many", json!({"entities": [
         {"name": "Wall", "mesh": "cube", "position": [1, 2, 3], "scale": [4, 1, 1], "color": "red"},
         {"name": "Ball", "mesh": "sphere", "rigidbody": {"mass": 2.0}}
@@ -33,11 +39,45 @@ fn tools_edit_scene() {
     assert_eq!(wall.transform.position.y, 2.0);
     assert!(wall.color[0] > 0.8);
     assert!(s.get(s.find("ball").unwrap()).unwrap().rigidbody.is_some());
-    execute(&mut s, &call("duplicate_entity", json!({"target": "Wall", "count": 3, "offset": [0, 0, -2]}))).unwrap();
-    assert_eq!(s.entities.iter().filter(|e| e.name.starts_with("Wall")).count(), 4);
-    assert!(execute(&mut s, &call("set_script", json!({"target": "Ball", "code": "fn update(dt) { this.x += "}))).is_err());
-    execute(&mut s, &call("set_script", json!({"target": "Ball", "code": "fn update(dt) { this.x += 1.0 * dt; }"}))).unwrap();
-    execute(&mut s, &call("add_camera", json!({"follow": "Ball", "position": [0, 5, 10]}))).unwrap();
+    execute(
+        &mut s,
+        &call(
+            "duplicate_entity",
+            json!({"target": "Wall", "count": 3, "offset": [0, 0, -2]}),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        s.entities
+            .iter()
+            .filter(|e| e.name.starts_with("Wall"))
+            .count(),
+        4
+    );
+    assert!(execute(
+        &mut s,
+        &call(
+            "set_script",
+            json!({"target": "Ball", "code": "fn update(dt) { this.x += "})
+        )
+    )
+    .is_err());
+    execute(
+        &mut s,
+        &call(
+            "set_script",
+            json!({"target": "Ball", "code": "fn update(dt) { this.x += 1.0 * dt; }"}),
+        ),
+    )
+    .unwrap();
+    execute(
+        &mut s,
+        &call(
+            "add_camera",
+            json!({"follow": "Ball", "position": [0, 5, 10]}),
+        ),
+    )
+    .unwrap();
     execute(&mut s, &call("delete_entity", json!({"target": "Wall"}))).unwrap();
     assert!(s.find("Wall").is_none());
     assert!(execute(&mut s, &call("nope", json!({}))).is_err());
@@ -55,8 +95,16 @@ fn platformer_plays() {
     }
     let player = rt.scene.find("Player").unwrap();
     let p = rt.scene.get(player).unwrap();
-    assert!(p.rigidbody.as_ref().unwrap().grounded, "player should be grounded, y={}", p.transform.position.y);
-    assert!((p.transform.position.y - 0.8).abs() < 0.05, "y={}", p.transform.position.y);
+    assert!(
+        p.rigidbody.as_ref().unwrap().grounded,
+        "player should be grounded, y={}",
+        p.transform.position.y
+    );
+    assert!(
+        (p.transform.position.y - 0.8).abs() < 0.05,
+        "y={}",
+        p.transform.position.y
+    );
     assert!(rt.hud().contains("Coins: 0"), "{}", rt.hud());
     // Walk right.
     let x0 = p.transform.position.x;
@@ -126,12 +174,20 @@ fn mock_llm() -> String {
                         {"name":"Orb","mesh":"sphere","position":[3,4.6,-2],"color":"gold"}]}}),
                     json!({"tool":"ask_coder","args":{"target":"Orb","goal":"spin"}}),
                 ];
-                calls.iter().map(|c| format!("```tool\n{c}\n```\n")).collect()
+                calls
+                    .iter()
+                    .map(|c| format!("```tool\n{c}\n```\n"))
+                    .collect()
             };
-            let mut out = String::from("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n");
+            let mut out = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
             for chunk in text.as_bytes().chunks(10) {
                 let piece = String::from_utf8_lossy(chunk);
-                out.push_str(&format!("data: {}\n\n", json!({"model":"mock-1","choices":[{"delta":{"content":piece}}]})));
+                out.push_str(&format!(
+                    "data: {}\n\n",
+                    json!({"model":"mock-1","choices":[{"delta":{"content":piece}}]})
+                ));
             }
             out.push_str("data: [DONE]\n\n");
             let _ = stream.write_all(out.as_bytes());
@@ -151,20 +207,31 @@ fn agents_build_scene_end_to_end() {
     let mut scene = Scene::starter();
     let job = Job {
         prompt: "Bir kule yap".into(),
-        mode: Mode::Agent,
+        mode: Mode::Planning,
         history: vec![],
         scene_json: scene.summary(),
         selected: None,
         settings,
         openrouter_key: String::new(),
+        web: false,
+        memory: crate::ai::memory::MemoryConfig {
+            backend: crate::ai::memory::MemoryBackend::Off,
+            ..Default::default()
+        },
+        session_id: "test".into(),
+        summary: String::new(),
     };
     let h = agent::spawn(job, egui::Context::default());
     let mut roles = vec![];
     let mut final_text = String::new();
     loop {
-        match h.rx.recv_timeout(std::time::Duration::from_secs(10)).expect("agent timed out") {
+        match h
+            .rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("agent timed out")
+        {
             AgentEvent::Start { role, .. } => {
-                roles.push(role.label());
+                roles.push(format!("{role:?}"));
                 final_text.clear();
             }
             AgentEvent::Delta { text } => final_text.push_str(&text),
@@ -181,4 +248,137 @@ fn agents_build_scene_end_to_end() {
     let orb = scene.get(scene.find("Orb").unwrap()).unwrap();
     assert!(orb.script.contains("this.ry"));
     assert!(scene.find("Tower").is_some());
+}
+
+#[test]
+fn parses_search_results() {
+    let ddg = r#"<div><a rel="nofollow" class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fbevy.org%2Flearn%2F&amp;rut=x">Bevy <b>Learn</b></a>
+    <a class="result__snippet" href="x">A refreshingly simple &amp; data-driven game engine</a></div>"#;
+    let hits = crate::ai::web::parse_ddg(ddg);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].url, "https://bevy.org/learn/");
+    assert_eq!(hits[0].title, "Bevy Learn");
+    assert!(hits[0].snippet.contains("simple & data"));
+    let bing = r#"<li class="b_algo"><h2><a href="https://www.rust-lang.org/" h="x">Rust Programming Language</a></h2><div><p>A language empowering everyone</p></div></li>"#;
+    let b = crate::ai::web::parse_bing(bing);
+    assert_eq!(b[0].url, "https://www.rust-lang.org/");
+    let text = crate::ai::web::html_to_text("<html><head><title>x</title></head><body><script>var a=1;</script><h1>Hello</h1><p>World &#39;ok&#39;</p></body></html>");
+    assert!(text.contains("Hello") && text.contains("World 'ok'") && !text.contains("var a"));
+}
+
+#[test]
+fn memory_ranks_and_extracts() {
+    use crate::ai::memory::{bm25, extract_facts};
+    let docs = [
+        "User likes neon cyberpunk levels",
+        "Coins should spin",
+        "Player jumps with space",
+    ];
+    let r = bm25(&docs, "cyberpunk neon level");
+    assert_eq!(r[0].0, 0);
+    let f = extract_facts("Merhaba. Oyunlarım hep gece temalı olsun! Bugün hava güzel.");
+    assert_eq!(f, vec!["Oyunlarım hep gece temalı olsun".to_string()]);
+}
+
+#[test]
+fn file_tools_are_sandboxed() {
+    use crate::ai::tools::{execute_in, project_path};
+    let dir = std::env::temp_dir().join(format!("forge-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    assert!(project_path(&dir, "../etc/passwd").is_err());
+    assert!(project_path(&dir, "/etc/passwd").is_ok_and(|p| p.starts_with(&dir)));
+    let mut s = Scene::starter();
+    let call = |name: &str, args| ToolCall {
+        name: name.into(),
+        args,
+    };
+    execute_in(&mut s, &call("write_file", json!({"path": "Scripts/spin.rhai", "content": "fn update(dt) { this.ry += 1.0 * dt; }"})), Some(&dir)).unwrap();
+    let ls = execute_in(&mut s, &call("list_files", json!({"path": ""})), Some(&dir))
+        .unwrap()
+        .result;
+    assert!(ls.contains("Scripts/spin.rhai"), "{ls}");
+    let g = execute_in(
+        &mut s,
+        &call("grep", json!({"pattern": "this.ry"})),
+        Some(&dir),
+    )
+    .unwrap()
+    .result;
+    assert!(g.contains("spin.rhai:1"));
+    execute_in(
+        &mut s,
+        &call(
+            "set_script",
+            json!({"target": "Cube", "file": "Scripts/spin.rhai"}),
+        ),
+        Some(&dir),
+    )
+    .unwrap();
+    assert!(s
+        .get(s.find("Cube").unwrap())
+        .unwrap()
+        .script
+        .contains("this.ry"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn prefab_roundtrip_and_reparent() {
+    let mut s = Scene::starter();
+    let cube = s.find("Cube").unwrap();
+    let child = s.spawn("Child", MeshKind::Sphere);
+    s.get_mut(child).unwrap().transform.position = glam::Vec3::new(2.0, 1.0, 0.0);
+    s.set_parent(child, Some(cube));
+    let w = s.world_matrix(child).w_axis.truncate();
+    assert!((w - glam::Vec3::new(2.0, 1.0, 0.0)).length() < 1e-3, "{w}");
+    let sub = s.subtree(cube);
+    assert_eq!(sub.len(), 2);
+    let n = s.entities.len();
+    let root = s
+        .instantiate(sub, Some(glam::Vec3::new(5.0, 0.0, 0.0)))
+        .unwrap();
+    assert_eq!(s.entities.len(), n + 2);
+    assert_eq!(s.children(Some(root)).len(), 1);
+}
+
+#[test]
+fn every_ui_glyph_exists_in_the_fonts() {
+    // Any symbol used inside a string literal must be renderable (no tofu boxes in the UI).
+    let ctx = egui::Context::default();
+    let _ = ctx.run(Default::default(), |_| {});
+    let mut used = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir("src")
+        .unwrap()
+        .chain(std::fs::read_dir("src/app").unwrap())
+        .chain(std::fs::read_dir("src/ai").unwrap())
+    {
+        let p = entry.unwrap().path();
+        if p.extension().map_or(true, |e| e != "rs") || p.ends_with("tests.rs") {
+            continue;
+        }
+        for line in std::fs::read_to_string(&p).unwrap().lines() {
+            let l = line.trim_start();
+            if l.starts_with("//") || l.starts_with("//!") {
+                continue;
+            }
+            for (i, part) in line.split('"').enumerate() {
+                if i % 2 == 1 {
+                    for c in part.chars().filter(|c| {
+                        (*c as u32) >= 0x2000 && !(0x2500..0x2580).contains(&(*c as u32))
+                    }) {
+                        used.insert(c);
+                    }
+                }
+            }
+        }
+    }
+    let mut missing = vec![];
+    ctx.fonts(|f| {
+        for c in &used {
+            if !f.has_glyphs(&egui::FontId::proportional(14.0), &c.to_string()) {
+                missing.push(*c);
+            }
+        }
+    });
+    assert!(missing.is_empty(), "glyphs without a font: {missing:?}");
 }

@@ -62,7 +62,11 @@ pub fn draw_logo(painter: &egui::Painter, rect: egui::Rect) {
         Stroke::NONE,
     ));
     // Stem.
-    painter.rect_filled(egui::Rect::from_min_max(p(0.10, 0.46), p(0.27, 0.88)), 0.0, BONE);
+    painter.rect_filled(
+        egui::Rect::from_min_max(p(0.10, 0.46), p(0.27, 0.88)),
+        0.0,
+        BONE,
+    );
     // Mid bar.
     painter.add(egui::Shape::convex_polygon(
         vec![p(0.33, 0.46), p(0.62, 0.46), p(0.54, 0.62), p(0.33, 0.62)],
@@ -70,11 +74,20 @@ pub fn draw_logo(painter: &egui::Painter, rect: egui::Rect) {
         Stroke::NONE,
     ));
     // Sparks.
-    for (x, y, r) in [(0.84, 0.14, 0.045), (0.93, 0.27, 0.035), (0.83, 0.33, 0.022)] {
+    for (x, y, r) in [
+        (0.84, 0.14, 0.045),
+        (0.93, 0.27, 0.035),
+        (0.83, 0.33, 0.022),
+    ] {
         let c = p(x, y);
         let d = r * s;
         painter.add(egui::Shape::convex_polygon(
-            vec![c + egui::vec2(0.0, -d), c + egui::vec2(d, 0.0), c + egui::vec2(0.0, d), c + egui::vec2(-d, 0.0)],
+            vec![
+                c + egui::vec2(0.0, -d),
+                c + egui::vec2(d, 0.0),
+                c + egui::vec2(0.0, d),
+                c + egui::vec2(-d, 0.0),
+            ],
             GOLD,
             Stroke::NONE,
         ));

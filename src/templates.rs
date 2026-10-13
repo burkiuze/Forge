@@ -14,14 +14,23 @@ impl Template {
     pub const ALL: [Template; 3] = [Template::Starter, Template::Platformer, Template::Empty];
     pub fn label(self) -> &'static str {
         match self {
-            Template::Empty => "Empty",
-            Template::Starter => "3D Starter (ground, light, camera)",
-            Template::Platformer => "Platformer sample (playable)",
+            Template::Empty => crate::i18n::t("Empty", "Boş"),
+            Template::Starter => crate::i18n::t(
+                "3D Starter (ground, light, camera)",
+                "3D Başlangıç (zemin, ışık, kamera)",
+            ),
+            Template::Platformer => crate::i18n::t(
+                "Platformer sample (playable)",
+                "Platform oyunu örneği (oynanabilir)",
+            ),
         }
     }
     pub fn build(self) -> Scene {
         match self {
-            Template::Empty => Scene { name: "Main".into(), ..Default::default() },
+            Template::Empty => Scene {
+                name: "Main".into(),
+                ..Default::default()
+            },
             Template::Starter => Scene::starter(),
             Template::Platformer => platformer(),
         }
@@ -43,7 +52,8 @@ fn update(dt) {
 }
 "#;
 
-const COIN: &str = r#"fn update(dt) { this.ry += 120.0 * dt; this.y = 1.2 + (this.time * 3.0).sin() * 0.15; }"#;
+const COIN: &str =
+    r#"fn update(dt) { this.ry += 120.0 * dt; this.y = 1.2 + (this.time * 3.0).sin() * 0.15; }"#;
 
 fn platformer() -> Scene {
     let mut s = Scene::starter();
@@ -60,7 +70,13 @@ fn platformer() -> Scene {
         e.rigidbody = Some(Rigidbody::default());
         e.script = PLAYER.into();
     }
-    let plats = [(4.0, 1.0, -3.0), (8.0, 2.0, -6.0), (3.0, 3.0, -10.0), (-3.0, 2.0, -7.0), (-7.0, 1.0, -3.0)];
+    let plats = [
+        (4.0, 1.0, -3.0),
+        (8.0, 2.0, -6.0),
+        (3.0, 3.0, -10.0),
+        (-3.0, 2.0, -7.0),
+        (-7.0, 1.0, -3.0),
+    ];
     for (i, (x, y, z)) in plats.iter().enumerate() {
         let id = s.spawn(&format!("Platform {}", i + 1), MeshKind::Cube);
         let e = s.get_mut(id).unwrap();
@@ -81,7 +97,27 @@ fn platformer() -> Scene {
         let e = s.get_mut(cam).unwrap();
         e.transform.position = Vec3::new(0.0, 7.0, 11.0);
         e.transform.rotation = Vec3::new(-25.0, 0.0, 0.0);
-        e.camera = Some(CameraComp { fov: 60.0, follow: "Player".into() });
+        e.camera = Some(CameraComp {
+            fov: 60.0,
+            follow: "Player".into(),
+        });
     }
     s
 }
+
+/// Ready-made behaviour scripts offered by "Add Component › Scripts".
+pub const SCRIPT_TEMPLATES: &[(&str, &str)] = &[
+    ("Player Controller", PLAYER),
+    ("Rotator", "fn update(dt) {\n    this.ry += 90.0 * dt;\n}\n"),
+    ("Bobbing", "fn start() { this.base_y = this.y; }\nfn update(dt) {\n    this.y = this.base_y + (this.time * 2.5).sin() * 0.25;\n}\n"),
+    ("Collectible", COIN),
+    (
+        "Enemy Patrol",
+        "fn start() { this.origin = this.x; this.dir = 1.0; this.speed = 3.0; }\nfn update(dt) {\n    this.x += this.dir * this.speed * dt;\n    if this.x > this.origin + 4.0 { this.dir = -1.0; }\n    if this.x < this.origin - 4.0 { this.dir = 1.0; }\n    if touching(this.name, \"Player\") { hud(\"Game Over!\"); }\n}\n",
+    ),
+    (
+        "Chase Player",
+        "fn start() { this.speed = 2.5; }\nfn update(dt) {\n    if !exists(\"Player\") { return; }\n    let p = pos_of(\"Player\");\n    let dx = p[0] - this.x; let dz = p[2] - this.z;\n    let d = (dx * dx + dz * dz).sqrt();\n    if d > 0.5 { this.x += dx / d * this.speed * dt; this.z += dz / d * this.speed * dt; }\n}\n",
+    ),
+    ("Flicker Light", "fn update(dt) {\n    this.sy = 1.0 + random(-0.05, 0.05);\n}\n"),
+];

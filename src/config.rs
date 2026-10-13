@@ -8,7 +8,9 @@ pub const LOCAL_LLAMA_PORT: u16 = 8089;
 
 /// Root data directory: `%APPDATA%\Forge` / `~/.local/share/Forge` / `~/Library/Application Support/Forge`.
 pub fn data_dir() -> PathBuf {
-    let dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("Forge");
+    let dir = dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Forge");
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -49,6 +51,16 @@ pub struct Settings {
     pub last_scene: Option<PathBuf>,
     pub projects_dir: PathBuf,
     pub custom_models: Vec<String>,
+    pub lang: crate::i18n::Lang,
+    pub memory: crate::ai::memory::MemoryConfig,
+    pub agent_web: bool,
+    pub agent_mode: crate::ai::agent::Mode,
+    pub snap: bool,
+    pub snap_move: f32,
+    pub snap_rotate: f32,
+    pub snap_scale: f32,
+    pub show_stats: bool,
+    pub show_grid: bool,
 }
 
 impl Default for Settings {
@@ -75,6 +87,16 @@ impl Default for Settings {
             last_scene: None,
             projects_dir: default_projects_dir(),
             custom_models: vec![],
+            lang: crate::i18n::detect(),
+            memory: Default::default(),
+            agent_web: true,
+            agent_mode: Default::default(),
+            snap: false,
+            snap_move: 0.5,
+            snap_rotate: 15.0,
+            snap_scale: 0.1,
+            show_stats: false,
+            show_grid: true,
         }
     }
 }
@@ -131,7 +153,13 @@ impl Secrets {
 
     /// Persist secrets to the user's private `.env` in the data directory.
     pub fn save(&self) -> std::io::Result<()> {
-        write_env(&env_file(), &[("OPENROUTER_API_KEY", &self.openrouter_key), ("HF_TOKEN", &self.hf_token)])
+        write_env(
+            &env_file(),
+            &[
+                ("OPENROUTER_API_KEY", &self.openrouter_key),
+                ("HF_TOKEN", &self.hf_token),
+            ],
+        )
     }
 }
 
@@ -139,7 +167,10 @@ fn write_env(path: &Path, kv: &[(&str, &str)]) -> std::io::Result<()> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let mut lines: Vec<String> = existing
         .lines()
-        .filter(|l| !kv.iter().any(|(k, _)| l.trim_start().starts_with(&format!("{k}="))))
+        .filter(|l| {
+            !kv.iter()
+                .any(|(k, _)| l.trim_start().starts_with(&format!("{k}=")))
+        })
         .map(str::to_string)
         .collect();
     for (k, v) in kv {

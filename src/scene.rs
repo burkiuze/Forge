@@ -62,7 +62,11 @@ pub struct Transform {
 
 impl Default for Transform {
     fn default() -> Self {
-        Self { position: Vec3::ZERO, rotation: Vec3::ZERO, scale: Vec3::ONE }
+        Self {
+            position: Vec3::ZERO,
+            rotation: Vec3::ZERO,
+            scale: Vec3::ONE,
+        }
     }
 }
 
@@ -91,22 +95,100 @@ pub struct Rigidbody {
 
 impl Default for Rigidbody {
     fn default() -> Self {
-        Self { mass: 1.0, use_gravity: true, is_static: false, bounciness: 0.0, velocity: Vec3::ZERO, grounded: false }
+        Self {
+            mass: 1.0,
+            use_gravity: true,
+            is_static: false,
+            bounciness: 0.0,
+            velocity: Vec3::ZERO,
+            grounded: false,
+        }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum LightKind {
+    #[default]
+    Directional,
+    Point,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Light {
+    pub kind: LightKind,
     pub color: [f32; 3],
     pub intensity: f32,
+    /// Point light reach in meters.
+    pub range: f32,
+    pub shadows: bool,
 }
 
 impl Default for Light {
     fn default() -> Self {
-        Self { color: [1.0, 0.96, 0.9], intensity: 1.0 }
+        Self {
+            kind: LightKind::Directional,
+            color: [1.0, 0.96, 0.9],
+            intensity: 1.0,
+            range: 10.0,
+            shadows: true,
+        }
     }
 }
+
+impl Light {
+    pub fn point() -> Self {
+        Self {
+            kind: LightKind::Point,
+            color: [1.0, 0.78, 0.45],
+            intensity: 2.0,
+            range: 8.0,
+            shadows: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Pattern {
+    #[default]
+    None,
+    Checker,
+    Grid,
+}
+
+/// PBR-ish surface parameters (albedo color lives on `Entity::color`).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Material {
+    pub metallic: f32,
+    pub roughness: f32,
+    pub emission: [f32; 3],
+    pub emission_strength: f32,
+    /// Texture path relative to the project folder (e.g. `Textures/bricks.png`).
+    pub texture: String,
+    pub tiling: f32,
+    pub pattern: Pattern,
+    pub unlit: bool,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            metallic: 0.0,
+            roughness: 0.5,
+            emission: [1.0, 0.6, 0.2],
+            emission_strength: 0.0,
+            texture: String::new(),
+            tiling: 1.0,
+            pattern: Pattern::None,
+            unlit: false,
+        }
+    }
+}
+
+pub const LAYERS: [&str; 6] = ["Default", "Environment", "Player", "Enemy", "Pickup", "UI"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -117,7 +199,10 @@ pub struct CameraComp {
 
 impl Default for CameraComp {
     fn default() -> Self {
-        Self { fov: 60.0, follow: String::new() }
+        Self {
+            fov: 60.0,
+            follow: String::new(),
+        }
     }
 }
 
@@ -132,6 +217,9 @@ pub struct Entity {
     pub transform: Transform,
     pub mesh: MeshKind,
     pub color: [f32; 3],
+    pub material: Material,
+    pub layer: String,
+    pub is_static: bool,
     pub collider: bool,
     pub trigger: bool,
     pub rigidbody: Option<Rigidbody>,
@@ -152,6 +240,9 @@ impl Default for Entity {
             transform: Transform::default(),
             mesh: MeshKind::None,
             color: [0.8, 0.8, 0.8],
+            material: Material::default(),
+            layer: "Default".into(),
+            is_static: false,
             collider: true,
             trigger: false,
             rigidbody: None,
@@ -170,6 +261,11 @@ pub struct Environment {
     pub ambient: f32,
     pub gravity: f32,
     pub sun_dir: Vec3,
+    pub fog_start: f32,
+    pub fog_end: f32,
+    pub shadows: bool,
+    pub shadow_softness: f32,
+    pub exposure: f32,
 }
 
 impl Default for Environment {
@@ -180,6 +276,11 @@ impl Default for Environment {
             ambient: 0.35,
             gravity: -18.0,
             sun_dir: Vec3::new(-0.4, -1.0, -0.3),
+            fog_start: 60.0,
+            fog_end: 300.0,
+            shadows: true,
+            shadow_softness: 1.0,
+            exposure: 1.0,
         }
     }
 }
@@ -195,14 +296,22 @@ pub struct Scene {
 
 impl Default for Scene {
     fn default() -> Self {
-        Self { name: "Untitled".into(), next_id: 1, entities: vec![], environment: Environment::default() }
+        Self {
+            name: "Untitled".into(),
+            next_id: 1,
+            entities: vec![],
+            environment: Environment::default(),
+        }
     }
 }
 
 impl Scene {
     /// Default scene: ground, sun, camera, and a cube.
     pub fn starter() -> Self {
-        let mut s = Scene { name: "Main".into(), ..Default::default() };
+        let mut s = Scene {
+            name: "Main".into(),
+            ..Default::default()
+        };
         let g = s.spawn("Ground", MeshKind::Plane);
         let e = s.get_mut(g).unwrap();
         e.transform.scale = Vec3::new(20.0, 1.0, 20.0);
@@ -228,16 +337,28 @@ impl Scene {
         let id = self.next_id;
         self.next_id += 1;
         let name = self.unique_name(name);
-        self.entities.push(Entity { id, name, mesh, ..Default::default() });
+        self.entities.push(Entity {
+            id,
+            name,
+            mesh,
+            ..Default::default()
+        });
         id
     }
 
     pub fn unique_name(&self, base: &str) -> String {
-        let base = if base.trim().is_empty() { "Entity" } else { base.trim() };
+        let base = if base.trim().is_empty() {
+            "Entity"
+        } else {
+            base.trim()
+        };
         if !self.entities.iter().any(|e| e.name == base) {
             return base.to_string();
         }
-        (1..).map(|i| format!("{base} ({i})")).find(|n| !self.entities.iter().any(|e| &e.name == n)).unwrap()
+        (1..)
+            .map(|i| format!("{base} ({i})"))
+            .find(|n| !self.entities.iter().any(|e| &e.name == n))
+            .unwrap()
     }
 
     pub fn get(&self, id: EntityId) -> Option<&Entity> {
@@ -258,7 +379,11 @@ impl Scene {
         self.entities
             .iter()
             .find(|e| e.name == key)
-            .or_else(|| self.entities.iter().find(|e| e.name.eq_ignore_ascii_case(key)))
+            .or_else(|| {
+                self.entities
+                    .iter()
+                    .find(|e| e.name.eq_ignore_ascii_case(key))
+            })
             .map(|e| e.id)
     }
 
@@ -268,7 +393,12 @@ impl Scene {
         let mut i = 0;
         while i < doomed.len() {
             let p = doomed[i];
-            doomed.extend(self.entities.iter().filter(|e| e.parent == Some(p)).map(|e| e.id));
+            doomed.extend(
+                self.entities
+                    .iter()
+                    .filter(|e| e.parent == Some(p))
+                    .map(|e| e.id),
+            );
             i += 1;
         }
         self.entities.retain(|e| !doomed.contains(&e.id));
@@ -283,6 +413,81 @@ impl Scene {
         let nid = e.id;
         self.entities.push(e);
         Some(nid)
+    }
+
+    /// The entity and all of its descendants (for prefabs / copy).
+    pub fn subtree(&self, id: EntityId) -> Vec<Entity> {
+        let mut ids = vec![id];
+        let mut i = 0;
+        while i < ids.len() {
+            let p = ids[i];
+            ids.extend(
+                self.entities
+                    .iter()
+                    .filter(|e| e.parent == Some(p))
+                    .map(|e| e.id),
+            );
+            i += 1;
+        }
+        ids.iter().filter_map(|i| self.get(*i).cloned()).collect()
+    }
+
+    /// Insert a subtree (from `subtree`) with fresh ids; returns the new root id.
+    pub fn instantiate(&mut self, mut ents: Vec<Entity>, at: Option<Vec3>) -> Option<EntityId> {
+        if ents.is_empty() {
+            return None;
+        }
+        let root_old = ents[0].id;
+        let mut map = std::collections::HashMap::new();
+        for e in &mut ents {
+            let nid = self.next_id;
+            self.next_id += 1;
+            map.insert(e.id, nid);
+            e.id = nid;
+        }
+        for (i, e) in ents.iter_mut().enumerate() {
+            e.parent = if i == 0 {
+                None
+            } else {
+                e.parent.and_then(|p| map.get(&p).copied())
+            };
+            e.name = self.unique_name(&e.name);
+            if i == 0 {
+                if let Some(p) = at {
+                    e.transform.position = p;
+                }
+            }
+            self.entities.push(e.clone());
+        }
+        map.get(&root_old).copied()
+    }
+
+    /// Re-parent keeping the world transform.
+    pub fn set_parent(&mut self, id: EntityId, parent: Option<EntityId>) {
+        if parent == Some(id) {
+            return;
+        }
+        // Refuse cycles.
+        let mut cur = parent;
+        while let Some(c) = cur {
+            if c == id {
+                return;
+            }
+            cur = self.get(c).and_then(|e| e.parent);
+        }
+        let world = self.world_matrix(id);
+        let parent_world = parent
+            .map(|p| self.world_matrix(p))
+            .unwrap_or(Mat4::IDENTITY);
+        let local = parent_world.inverse() * world;
+        let (s, r, t) = local.to_scale_rotation_translation();
+        let (x, y, z) = r.to_euler(EulerRot::XYZ);
+        if let Some(e) = self.get_mut(id) {
+            e.parent = parent;
+            e.transform.position = t;
+            e.transform.scale = s;
+            e.transform.rotation = Vec3::new(x, y, z) * (180.0 / std::f32::consts::PI);
+        }
     }
 
     /// World matrix including parent chain.
@@ -313,13 +518,43 @@ impl Scene {
     }
 
     pub fn children(&self, id: Option<EntityId>) -> Vec<EntityId> {
-        self.entities.iter().filter(|e| e.parent == id).map(|e| e.id).collect()
+        self.entities
+            .iter()
+            .filter(|e| e.parent == id)
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// Color × intensity of the main directional light.
+    pub fn sun_color(&self) -> [f32; 3] {
+        self.entities
+            .iter()
+            .find(|e| {
+                e.active
+                    && e.light
+                        .as_ref()
+                        .map_or(false, |l| l.kind == LightKind::Directional)
+            })
+            .and_then(|e| e.light.as_ref())
+            .map(|l| {
+                [
+                    l.color[0] * l.intensity,
+                    l.color[1] * l.intensity,
+                    l.color[2] * l.intensity,
+                ]
+            })
+            .unwrap_or([0.0; 3])
     }
 
     pub fn sun_dir(&self) -> Vec3 {
         self.entities
             .iter()
-            .find(|e| e.light.is_some() && e.active)
+            .find(|e| {
+                e.light
+                    .as_ref()
+                    .map_or(false, |l| l.kind == LightKind::Directional)
+                    && e.active
+            })
             .map(|e| e.transform.quat() * Vec3::NEG_Z)
             .unwrap_or(self.environment.sun_dir)
             .normalize_or(Vec3::NEG_Y)
@@ -361,7 +596,11 @@ impl Scene {
                 }
                 if e.trigger { o.insert("trigger".into(), true.into()); }
                 if !e.collider { o.insert("collider".into(), false.into()); }
-                if e.light.is_some() { o.insert("light".into(), true.into()); }
+                if let Some(l) = &e.light { o.insert("light".into(), serde_json::json!({"kind": l.kind, "intensity": l.intensity})); }
+                if e.material.metallic > 0.0 || e.material.emission_strength > 0.0 || !e.material.texture.is_empty() {
+                    o.insert("material".into(), serde_json::json!({"metallic": e.material.metallic, "roughness": e.material.roughness, "emission": e.material.emission_strength, "texture": e.material.texture}));
+                }
+                if e.layer != "Default" { o.insert("layer".into(), e.layer.clone().into()); }
                 if let Some(c) = &e.camera { o.insert("camera".into(), serde_json::json!({"fov": c.fov, "follow": c.follow})); }
                 if !e.script.is_empty() { o.insert("script_lines".into(), e.script.lines().count().into()); }
                 v
@@ -388,19 +627,35 @@ pub fn color_hex(c: [f32; 3]) -> String {
 /// Parses `#rrggbb`, `rrggbb`, a few color names, or `[r,g,b]` (0..1 or 0..255).
 pub fn parse_color(v: &serde_json::Value) -> Option<[f32; 3]> {
     if let Some(arr) = v.as_array() {
-        let f: Vec<f32> = arr.iter().filter_map(|x| x.as_f64()).map(|x| x as f32).collect();
+        let f: Vec<f32> = arr
+            .iter()
+            .filter_map(|x| x.as_f64())
+            .map(|x| x as f32)
+            .collect();
         if f.len() >= 3 {
-            let scale = if f.iter().any(|x| *x > 1.0) { 255.0 } else { 1.0 };
+            let scale = if f.iter().any(|x| *x > 1.0) {
+                255.0
+            } else {
+                1.0
+            };
             return Some([f[0] / scale, f[1] / scale, f[2] / scale]);
         }
         return None;
     }
     let s = v.as_str()?.trim().to_ascii_lowercase();
     let named = match s.as_str() {
-        "red" => Some("#e53935"), "green" => Some("#43a047"), "blue" => Some("#1e88e5"),
-        "yellow" => Some("#fdd835"), "orange" => Some("#f05a1e"), "purple" => Some("#8e24aa"),
-        "white" => Some("#f5f5f5"), "black" => Some("#202020"), "gray" | "grey" => Some("#808080"),
-        "brown" => Some("#795548"), "cyan" => Some("#00bcd4"), "pink" => Some("#ec407a"),
+        "red" => Some("#e53935"),
+        "green" => Some("#43a047"),
+        "blue" => Some("#1e88e5"),
+        "yellow" => Some("#fdd835"),
+        "orange" => Some("#f05a1e"),
+        "purple" => Some("#8e24aa"),
+        "white" => Some("#f5f5f5"),
+        "black" => Some("#202020"),
+        "gray" | "grey" => Some("#808080"),
+        "brown" => Some("#795548"),
+        "cyan" => Some("#00bcd4"),
+        "pink" => Some("#ec407a"),
         "gold" => Some("#ffc107"),
         _ => None,
     };
@@ -408,6 +663,10 @@ pub fn parse_color(v: &serde_json::Value) -> Option<[f32; 3]> {
     if h.len() != 6 {
         return None;
     }
-    let p = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok().map(|x| x as f32 / 255.0);
+    let p = |i: usize| {
+        u8::from_str_radix(&h[i..i + 2], 16)
+            .ok()
+            .map(|x| x as f32 / 255.0)
+    };
     Some([p(0)?, p(2)?, p(4)?])
 }

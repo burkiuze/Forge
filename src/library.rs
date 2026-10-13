@@ -2,7 +2,9 @@
 //! llama.cpp runtime (download + run `llama-server`), and list Ollama models.
 
 use crate::ai::client;
+use crate::catalog::{self, Cat, Entry, Fit};
 use crate::config::{human_size, Secrets, Settings, LOCAL_LLAMA_PORT};
+use crate::i18n::t;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -11,11 +13,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const FEATURED: &[(&str, &str)] = &[
-    ("Qwen/Qwen2.5-Coder-7B-Instruct-GGUF", "Coding · 7B · great for scripts"),
-    ("unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF", "Agentic coding MoE · 3B active"),
+    (
+        "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+        "Coding · 7B · great for scripts",
+    ),
+    (
+        "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+        "Agentic coding MoE · 3B active",
+    ),
     ("Qwen/Qwen3-8B-GGUF", "General · 8B · tool use"),
     ("unsloth/gemma-3-4b-it-GGUF", "Gemma · 4B · fast on laptops"),
-    ("bartowski/Llama-3.2-3B-Instruct-GGUF", "Llama · 3B · tiny & quick"),
+    (
+        "bartowski/Llama-3.2-3B-Instruct-GGUF",
+        "Llama · 3B · tiny & quick",
+    ),
 ];
 
 #[derive(Clone)]
@@ -51,7 +62,11 @@ pub enum DlStatus {
 impl Download {
     pub fn progress(&self) -> f32 {
         let t = self.total.load(Ordering::Relaxed);
-        if t == 0 { 0.0 } else { self.done.load(Ordering::Relaxed) as f32 / t as f32 }
+        if t == 0 {
+            0.0
+        } else {
+            self.done.load(Ordering::Relaxed) as f32 / t as f32
+        }
     }
 }
 
@@ -76,11 +91,18 @@ pub struct Library {
     llama: Option<Child>,
     pub runtime_state: Arc<Mutex<RuntimeState>>,
     tab: LibTab,
+    catalog: Vec<Entry>,
+    cat_query: String,
+    cat_filter: Option<Cat>,
+    cat_fits: bool,
+    cat_recommended: bool,
+    pub ram_gb: f32,
 }
 
 #[derive(PartialEq, Clone, Copy)]
 enum LibTab {
     Cloud,
+    Catalog,
     Local,
     HuggingFace,
 }
@@ -100,6 +122,12 @@ impl Default for Library {
             llama: None,
             runtime_state: Arc::new(Mutex::new(RuntimeState::Stopped)),
             tab: LibTab::Cloud,
+            catalog: catalog::entries(),
+            cat_query: String::new(),
+            cat_filter: None,
+            cat_fits: false,
+            cat_recommended: false,
+            ram_gb: catalog::system_ram_gb(),
         }
     }
 }
@@ -131,84 +159,177 @@ fn get_json(url: &str, token: &str) -> Result<Value, String> {
 fn url_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => (b as char).to_string(),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                (b as char).to_string()
+            }
             _ => format!("%{b:02X}"),
         })
         .collect()
 }
 
 /// Resumable streaming download into `dest` (via `dest.part`).
-pub fn start_download(label: String, url: String, dest: PathBuf, token: String, ctx: egui::Context) -> Arc<Download> {
-    let dl = Arc::new(Download {
+pub fn new_download(label: String) -> Arc<Download> {
+    Arc::new(Download {
         label,
         total: AtomicU64::new(0),
         done: AtomicU64::new(0),
         cancel: AtomicBool::new(false),
         status: Mutex::new(DlStatus::Running),
-    });
+    })
+}
+
+/// Blocking, resumable download of `url` into `dest` (via `dest.part`). When `own_total`
+/// is set the progress total comes from Content-Length, otherwise the caller preset it.
+fn fetch_to(
+    d: &Download,
+    url: &str,
+    dest: &Path,
+    token: &str,
+    ctx: &egui::Context,
+    own_total: bool,
+) -> Result<(), String> {
+    if let Some(p) = dest.parent() {
+        std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+    }
+    let part = dest.with_extension(format!(
+        "{}.part",
+        dest.extension().and_then(|e| e.to_str()).unwrap_or("bin")
+    ));
+    let existing = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(20))
+        .timeout_read(std::time::Duration::from_secs(60))
+        .build();
+    let mut req = agent.get(url).set("User-Agent", "Forge");
+    if !token.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {token}"));
+    }
+    if existing > 0 {
+        req = req.set("Range", &format!("bytes={existing}-"));
+    }
+    let resp = req.call().map_err(|e| e.to_string())?;
+    let resumed = resp.status() == 206;
+    let len: u64 = resp
+        .header("Content-Length")
+        .and_then(|l| l.parse().ok())
+        .unwrap_or(0);
+    let start = if resumed { existing } else { 0 };
+    if own_total {
+        d.total.store(start + len, Ordering::Relaxed);
+        d.done.store(start, Ordering::Relaxed);
+    } else {
+        d.done.fetch_add(start, Ordering::Relaxed);
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resumed)
+        .truncate(!resumed)
+        .open(&part)
+        .map_err(|e| e.to_string())?;
+    let mut reader = resp.into_reader();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut last_repaint = std::time::Instant::now();
+    loop {
+        if d.cancel.load(Ordering::Relaxed) {
+            return Err("cancelled".into());
+        }
+        let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
+        d.done.fetch_add(n as u64, Ordering::Relaxed);
+        if last_repaint.elapsed().as_millis() > 150 {
+            ctx.request_repaint();
+            last_repaint = std::time::Instant::now();
+        }
+    }
+    file.flush().map_err(|e| e.to_string())?;
+    drop(file);
+    std::fs::rename(&part, dest).map_err(|e| e.to_string())
+}
+
+fn finish(d: &Download, res: Result<(), String>, ctx: &egui::Context) {
+    *d.status.lock().unwrap() = match res {
+        Ok(()) => DlStatus::Finished,
+        Err(e) => DlStatus::Failed(e),
+    };
+    ctx.request_repaint();
+}
+
+/// Resumable streaming download into `dest` on a background thread.
+pub fn start_download(
+    label: String,
+    url: String,
+    dest: PathBuf,
+    token: String,
+    ctx: egui::Context,
+) -> Arc<Download> {
+    let dl = new_download(label);
     let d = dl.clone();
     std::thread::spawn(move || {
-        let res = (|| -> Result<(), String> {
-            if let Some(p) = dest.parent() {
-                std::fs::create_dir_all(p).map_err(|e| e.to_string())?;
+        let r = fetch_to(&d, &url, &dest, &token, &ctx, true);
+        finish(&d, r, &ctx);
+    });
+    dl
+}
+
+/// List every file (path, size) of a Hugging Face model repo.
+pub fn hf_files(repo: &str, token: &str) -> Result<Vec<(String, u64)>, String> {
+    let v = get_json(
+        &format!("https://huggingface.co/api/models/{repo}/tree/main?recursive=true"),
+        token,
+    )?;
+    Ok(v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|f| f["type"] == "file")
+                .map(|f| {
+                    (
+                        f["path"].as_str().unwrap_or_default().to_string(),
+                        f["lfs"]["size"]
+                            .as_u64()
+                            .or(f["size"].as_u64())
+                            .unwrap_or(0),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+/// Download a catalog entry: resolve the quantization's file(s) in the repo, then fetch all parts.
+pub fn start_catalog_download(
+    entry: &Entry,
+    models_dir: PathBuf,
+    token: String,
+    ctx: egui::Context,
+) -> Arc<Download> {
+    let dl = new_download(format!("{} · {}", entry.name, entry.quant));
+    let d = dl.clone();
+    let (repo, quant) = (entry.repo.to_string(), entry.quant.to_string());
+    std::thread::spawn(move || {
+        let r = (|| -> Result<(), String> {
+            let files = catalog::pick_files(&hf_files(&repo, &token)?, &quant);
+            if files.is_empty() {
+                return Err(format!(
+                    "{quant} is not available in {repo} — pick another quantization"
+                ));
             }
-            let part = dest.with_extension(format!(
-                "{}.part",
-                dest.extension().and_then(|e| e.to_str()).unwrap_or("bin")
-            ));
-            let existing = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-            let agent = ureq::AgentBuilder::new()
-                .timeout_connect(std::time::Duration::from_secs(20))
-                .timeout_read(std::time::Duration::from_secs(60))
-                .build();
-            let mut req = agent.get(&url).set("User-Agent", "Forge");
-            if !token.is_empty() {
-                req = req.set("Authorization", &format!("Bearer {token}"));
+            d.total
+                .store(files.iter().map(|f| f.1).sum(), Ordering::Relaxed);
+            for (path, _) in &files {
+                let name = path.rsplit('/').next().unwrap_or(path);
+                let url = format!(
+                    "https://huggingface.co/{repo}/resolve/main/{}",
+                    url_encode(path)
+                );
+                fetch_to(&d, &url, &models_dir.join(name), &token, &ctx, false)?;
             }
-            if existing > 0 {
-                req = req.set("Range", &format!("bytes={existing}-"));
-            }
-            let resp = req.call().map_err(|e| e.to_string())?;
-            let resumed = resp.status() == 206;
-            let len: u64 = resp.header("Content-Length").and_then(|l| l.parse().ok()).unwrap_or(0);
-            let start = if resumed { existing } else { 0 };
-            d.total.store(start + len, Ordering::Relaxed);
-            d.done.store(start, Ordering::Relaxed);
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .append(resumed)
-                .truncate(!resumed)
-                .open(&part)
-                .map_err(|e| e.to_string())?;
-            let mut reader = resp.into_reader();
-            let mut buf = vec![0u8; 1 << 20];
-            let mut last_repaint = std::time::Instant::now();
-            loop {
-                if d.cancel.load(Ordering::Relaxed) {
-                    return Err("cancelled".into());
-                }
-                let n = reader.read(&mut buf).map_err(|e| e.to_string())?;
-                if n == 0 {
-                    break;
-                }
-                file.write_all(&buf[..n]).map_err(|e| e.to_string())?;
-                d.done.fetch_add(n as u64, Ordering::Relaxed);
-                if last_repaint.elapsed().as_millis() > 150 {
-                    ctx.request_repaint();
-                    last_repaint = std::time::Instant::now();
-                }
-            }
-            file.flush().map_err(|e| e.to_string())?;
-            drop(file);
-            std::fs::rename(&part, &dest).map_err(|e| e.to_string())?;
             Ok(())
         })();
-        *d.status.lock().unwrap() = match res {
-            Ok(()) => DlStatus::Finished,
-            Err(e) => DlStatus::Failed(e),
-        };
-        ctx.request_repaint();
+        finish(&d, r, &ctx);
     });
     dl
 }
@@ -219,9 +340,19 @@ impl Library {
         if let Ok(rd) = std::fs::read_dir(&settings.models_dir) {
             for e in rd.flatten() {
                 let p = e.path();
-                if p.extension().and_then(|x| x.to_str()) == Some("gguf") {
+                let fname = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                // Show split models once (by their first part).
+                let later_part = fname.contains("-of-") && !fname.contains("-00001-of-");
+                if p.extension().and_then(|x| x.to_str()) == Some("gguf")
+                    && !later_part
+                    && !fname.contains("mmproj")
+                {
                     let size = e.metadata().map(|m| m.len()).unwrap_or(0);
-                    self.installed.push((p.file_name().unwrap().to_string_lossy().to_string(), size));
+                    self.installed
+                        .push((p.file_name().unwrap().to_string_lossy().to_string(), size));
                 }
             }
         }
@@ -229,7 +360,10 @@ impl Library {
     }
 
     pub fn installed_models(&self) -> Vec<String> {
-        self.installed.iter().map(|(n, _)| format!("local:{n}")).collect()
+        self.installed
+            .iter()
+            .map(|(n, _)| format!("local:{n}"))
+            .collect()
     }
 
     pub fn ollama_models(&self) -> Vec<String> {
@@ -278,10 +412,16 @@ impl Library {
                     .as_array()
                     .map(|a| {
                         a.iter()
-                            .filter(|f| f["type"] == "file" && f["path"].as_str().map_or(false, |p| p.ends_with(".gguf")))
+                            .filter(|f| {
+                                f["type"] == "file"
+                                    && f["path"].as_str().map_or(false, |p| p.ends_with(".gguf"))
+                            })
                             .map(|f| HfFile {
                                 path: f["path"].as_str().unwrap().to_string(),
-                                size: f["lfs"]["size"].as_u64().or(f["size"].as_u64()).unwrap_or(0),
+                                size: f["lfs"]["size"]
+                                    .as_u64()
+                                    .or(f["size"].as_u64())
+                                    .unwrap_or(0),
                             })
                             .collect()
                     })
@@ -295,14 +435,22 @@ impl Library {
     }
 
     pub fn refresh_ollama(&self, settings: &Settings, ctx: &egui::Context) {
-        let base = settings.ollama_url.trim_end_matches('/').trim_end_matches("/v1").to_string();
+        let base = settings
+            .ollama_url
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .to_string();
         let slot = self.ollama.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = get_json(&format!("{base}/api/tags"), "").map(|v| {
                 v["models"]
                     .as_array()
-                    .map(|a| a.iter().filter_map(|m| m["name"].as_str().map(str::to_string)).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|m| m["name"].as_str().map(str::to_string))
+                            .collect()
+                    })
                     .unwrap_or_default()
             });
             *slot.lock().unwrap() = Some(r);
@@ -317,7 +465,11 @@ impl Library {
             let p = PathBuf::from(settings.llama_server.trim());
             return p.is_file().then_some(p);
         }
-        let exe = if cfg!(windows) { "llama-server.exe" } else { "llama-server" };
+        let exe = if cfg!(windows) {
+            "llama-server.exe"
+        } else {
+            "llama-server"
+        };
         find_file(&settings.runtime_dir, exe, 4)
     }
 
@@ -335,28 +487,51 @@ impl Library {
         self.runtime_dl = Some(dl.clone());
         std::thread::spawn(move || {
             let res = (|| -> Result<(), String> {
-                let rel = get_json("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest", "")?;
+                let rel = get_json(
+                    "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest",
+                    "",
+                )?;
                 let assets = rel["assets"].as_array().ok_or("no assets")?;
                 let prefs: &[&str] = if cfg!(windows) {
-                    &["bin-win-vulkan-x64.zip", "bin-win-cpu-x64.zip", "bin-win-avx2-x64.zip"]
+                    &[
+                        "bin-win-vulkan-x64.zip",
+                        "bin-win-cpu-x64.zip",
+                        "bin-win-avx2-x64.zip",
+                    ]
                 } else if cfg!(target_os = "macos") {
-                    if cfg!(target_arch = "aarch64") { &["bin-macos-arm64"] } else { &["bin-macos-x64"] }
+                    if cfg!(target_arch = "aarch64") {
+                        &["bin-macos-arm64"]
+                    } else {
+                        &["bin-macos-x64"]
+                    }
                 } else {
                     &["bin-ubuntu-vulkan-x64", "bin-ubuntu-x64"]
                 };
                 let asset = prefs
                     .iter()
-                    .find_map(|p| assets.iter().find(|a| a["name"].as_str().map_or(false, |n| n.contains(p))))
+                    .find_map(|p| {
+                        assets
+                            .iter()
+                            .find(|a| a["name"].as_str().map_or(false, |n| n.contains(p)))
+                    })
                     .ok_or("no matching llama.cpp build for this platform")?;
                 let name = asset["name"].as_str().unwrap().to_string();
                 let url = asset["browser_download_url"].as_str().unwrap().to_string();
                 std::fs::create_dir_all(&runtime_dir).map_err(|e| e.to_string())?;
                 let archive = runtime_dir.join(&name);
-                let inner = start_download(name.clone(), url, archive.clone(), String::new(), ctx2.clone());
+                let inner = start_download(
+                    name.clone(),
+                    url,
+                    archive.clone(),
+                    String::new(),
+                    ctx2.clone(),
+                );
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(200));
-                    dl.total.store(inner.total.load(Ordering::Relaxed), Ordering::Relaxed);
-                    dl.done.store(inner.done.load(Ordering::Relaxed), Ordering::Relaxed);
+                    dl.total
+                        .store(inner.total.load(Ordering::Relaxed), Ordering::Relaxed);
+                    dl.done
+                        .store(inner.done.load(Ordering::Relaxed), Ordering::Relaxed);
                     if dl.cancel.load(Ordering::Relaxed) {
                         inner.cancel.store(true, Ordering::Relaxed);
                     }
@@ -380,19 +555,36 @@ impl Library {
         });
     }
 
-    pub fn start_llama(&mut self, settings: &Settings, model_file: &str, ctx: &egui::Context) -> Result<(), String> {
+    pub fn start_llama(
+        &mut self,
+        settings: &Settings,
+        model_file: &str,
+        ctx: &egui::Context,
+    ) -> Result<(), String> {
         self.stop_llama();
-        let server = Self::find_llama_server(settings).ok_or("llama-server not found — install the runtime first (Library ▸ Local).")?;
+        let server = Self::find_llama_server(settings)
+            .ok_or("llama-server not found — install the runtime first (Library › Local).")?;
         let model = settings.models_dir.join(model_file);
         if !model.is_file() {
             return Err(format!("model file missing: {}", model.display()));
         }
-        let log = std::fs::File::create(settings.runtime_dir.join("llama-server.log")).map_err(|e| e.to_string())?;
+        let log = std::fs::File::create(settings.runtime_dir.join("llama-server.log"))
+            .map_err(|e| e.to_string())?;
         let mut cmd = Command::new(&server);
         cmd.arg("-m")
             .arg(&model)
-            .args(["--host", "127.0.0.1", "--port", &LOCAL_LLAMA_PORT.to_string()])
-            .args(["-c", &settings.llama_ctx.to_string(), "-ngl", &settings.llama_gpu_layers.to_string()])
+            .args([
+                "--host",
+                "127.0.0.1",
+                "--port",
+                &LOCAL_LLAMA_PORT.to_string(),
+            ])
+            .args([
+                "-c",
+                &settings.llama_ctx.to_string(),
+                "-ngl",
+                &settings.llama_gpu_layers.to_string(),
+            ])
             .stdout(Stdio::null())
             .stderr(Stdio::from(log));
         if let Some(dir) = server.parent() {
@@ -403,7 +595,9 @@ impl Library {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
-        let child = cmd.spawn().map_err(|e| format!("failed to start llama-server: {e}"))?;
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("failed to start llama-server: {e}"))?;
         self.llama = Some(child);
         *self.runtime_state.lock().unwrap() = RuntimeState::Starting(model_file.to_string());
         let state = self.runtime_state.clone();
@@ -424,7 +618,9 @@ impl Library {
                     }
                 }
             }
-            *state.lock().unwrap() = RuntimeState::Failed("llama-server did not become ready (see runtime/llama-server.log)".into());
+            *state.lock().unwrap() = RuntimeState::Failed(
+                "llama-server did not become ready (see runtime/llama-server.log)".into(),
+            );
             ctx.request_repaint();
         });
         Ok(())
@@ -452,36 +648,76 @@ impl Library {
             let st = dl.status.lock().unwrap().clone();
             match st {
                 DlStatus::Running => {
-                    ui.add(egui::ProgressBar::new(dl.progress()).show_percentage().text("Downloading llama.cpp…"));
+                    ui.add(
+                        egui::ProgressBar::new(dl.progress())
+                            .show_percentage()
+                            .text("Downloading llama.cpp…"),
+                    );
                 }
                 DlStatus::Failed(e) => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Runtime install failed: {e}"));
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        format!(
+                            "{} {e}",
+                            t("Runtime install failed:", "Çalışma zamanı kurulamadı:")
+                        ),
+                    );
                 }
                 DlStatus::Finished => {}
             }
         }
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui, settings: &mut Settings, secrets: &Secrets, current_model: &str) -> Vec<LibAction> {
+    pub fn ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &mut Settings,
+        secrets: &Secrets,
+        current_model: &str,
+    ) -> Vec<LibAction> {
         let mut actions = vec![];
-        ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, LibTab::Cloud, "☁ Cloud");
-            ui.selectable_value(&mut self.tab, LibTab::Local, "💻 Local");
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(
+                &mut self.tab,
+                LibTab::Cloud,
+                format!("☁ {}", t("Cloud", "Bulut")),
+            );
+            ui.selectable_value(
+                &mut self.tab,
+                LibTab::Catalog,
+                format!("📦 {} ({})", t("Models", "Modeller"), self.catalog.len()),
+            );
+            ui.selectable_value(
+                &mut self.tab,
+                LibTab::Local,
+                format!("💻 {}", t("Installed", "Kurulu")),
+            );
             ui.selectable_value(&mut self.tab, LibTab::HuggingFace, "⬇ HF Hub");
         });
         ui.separator();
-        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| match self.tab {
-            LibTab::Cloud => self.ui_cloud(ui, settings, current_model, &mut actions),
-            LibTab::Local => self.ui_local(ui, settings, current_model, &mut actions),
-            LibTab::HuggingFace => self.ui_hub(ui, settings, secrets, &mut actions),
-        });
+        match self.tab {
+            LibTab::Catalog => self.ui_catalog(ui, settings, secrets, current_model, &mut actions),
+            tab => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .show(ui, |ui| match tab {
+                        LibTab::Cloud => self.ui_cloud(ui, settings, current_model, &mut actions),
+                        LibTab::Local => self.ui_local(ui, settings, current_model, &mut actions),
+                        _ => self.ui_hub(ui, settings, secrets, &mut actions),
+                    });
+            }
+        }
         // Finished downloads → refresh installed list.
         let before = self.downloads.len();
         self.downloads.retain(|d| {
             let st = d.status.lock().unwrap().clone();
             match st {
                 DlStatus::Finished => {
-                    actions.push(LibAction::Log(format!("Downloaded {}", d.label)));
+                    actions.push(LibAction::Log(format!(
+                        "{} {}",
+                        t("Downloaded", "İndirildi:"),
+                        d.label
+                    )));
                     false
                 }
                 _ => true,
@@ -493,22 +729,30 @@ impl Library {
         actions
     }
 
-    fn ui_cloud(&mut self, ui: &mut egui::Ui, settings: &mut Settings, current: &str, actions: &mut Vec<LibAction>) {
-        ui.label(egui::RichText::new("OpenRouter models").strong());
-        ui.small("Free tier · no download needed");
-        ui.add_space(4.0);
+    fn ui_cloud(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &mut Settings,
+        current: &str,
+        actions: &mut Vec<LibAction>,
+    ) {
         for m in crate::ai::models::CLOUD_MODELS {
             let active = current == m.id;
-            model_card(ui, m.name, m.blurb, m.id, active, || actions.push(LibAction::UseModel(m.id.to_string())));
+            model_card(ui, m.name, m.blurb, m.id, active, || {
+                actions.push(LibAction::UseModel(m.id.to_string()))
+            });
         }
         ui.add_space(6.0);
-        ui.collapsing("Custom OpenRouter model", |ui| {
-            ui.small("Any model id from openrouter.ai/models, e.g. vendor/model:free");
+        ui.collapsing(t("Custom model id", "Özel model kimliği"), |ui| {
+            ui.small(t(
+                "Any model id from openrouter.ai/models, e.g. vendor/model:free",
+                "openrouter.ai/models'tan herhangi bir kimlik, örn. vendor/model:free",
+            ));
             let id = ui.make_persistent_id("custom_model_input");
             let mut text = ui.data_mut(|d| d.get_temp::<String>(id).unwrap_or_default());
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut text);
-                if ui.button("Add").clicked() && !text.trim().is_empty() {
+                if ui.button(t("Add", "Ekle")).clicked() && !text.trim().is_empty() {
                     settings.custom_models.push(text.trim().to_string());
                     settings.save();
                     text.clear();
@@ -533,25 +777,279 @@ impl Library {
         });
     }
 
-    fn ui_local(&mut self, ui: &mut egui::Ui, settings: &mut Settings, current: &str, actions: &mut Vec<LibAction>) {
+    fn ui_catalog(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &mut Settings,
+        secrets: &Secrets,
+        current: &str,
+        actions: &mut Vec<LibAction>,
+    ) {
+        let ram = self.ram_gb;
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.cat_query)
+                    .hint_text(t("🔍 Search models…", "🔍 Model ara…"))
+                    .desired_width(f32::INFINITY),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .selectable_label(self.cat_filter.is_none(), t("All", "Tümü"))
+                .clicked()
+            {
+                self.cat_filter = None;
+            }
+            for c in Cat::ALL {
+                if ui
+                    .selectable_label(self.cat_filter == Some(c), c.label())
+                    .clicked()
+                {
+                    self.cat_filter = Some(c);
+                }
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(&mut self.cat_fits, t("Fits my PC", "Bilgisayarıma uygun"));
+            ui.checkbox(&mut self.cat_recommended, t("Q4_K_M only", "Sadece Q4_K_M"));
+        });
+        ui.small(format!(
+            "{}: {:.0} GB RAM",
+            t("This PC", "Bu bilgisayar"),
+            ram
+        ));
+        self.downloads_ui(ui);
+        let q = self.cat_query.to_lowercase();
+        let list: Vec<Entry> = self
+            .catalog
+            .iter()
+            .filter(|e| self.cat_filter.map_or(true, |c| c == e.cat))
+            .filter(|e| !self.cat_fits || catalog::fit(e, ram) != Fit::TooBig)
+            .filter(|e| !self.cat_recommended || e.recommended())
+            .filter(|e| {
+                q.is_empty()
+                    || e.name.to_lowercase().contains(&q)
+                    || e.repo.to_lowercase().contains(&q)
+                    || e.quant.to_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect();
+        ui.small(format!("{} {}", list.len(), t("variants", "varyant")));
+        ui.separator();
+        let row_h = 74.0;
+        let mut start: Option<Entry> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show_rows(ui, row_h, list.len(), |ui, range| {
+                for e in &list[range] {
+                    let installed = self.is_installed(e, settings);
+                    let downloading = self
+                        .downloads
+                        .iter()
+                        .any(|d| d.label == format!("{} · {}", e.name, e.quant));
+                    egui::Frame::group(ui.style())
+                        .inner_margin(6)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.set_height(row_h - 18.0);
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new(e.name).strong());
+                                let qc = if e.recommended() {
+                                    crate::theme::GOLD
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                };
+                                ui.label(
+                                    egui::RichText::new(e.quant).small().monospace().color(qc),
+                                )
+                                .on_hover_text(e.note);
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if let Some(file) = installed.clone() {
+                                            let id = format!("local:{file}");
+                                            let label = if current == id {
+                                                t("✔ In use", "✔ Kullanımda")
+                                            } else {
+                                                t("▶ Use", "▶ Kullan")
+                                            };
+                                            if ui.small_button(label).clicked() {
+                                                match self.start_llama(settings, &file, ui.ctx()) {
+                                                    Ok(()) => actions.push(LibAction::UseModel(id)),
+                                                    Err(err) => actions.push(LibAction::Log(err)),
+                                                }
+                                            }
+                                        } else if downloading {
+                                            ui.spinner();
+                                        } else if ui
+                                            .small_button(t("⬇ Download", "⬇ İndir"))
+                                            .clicked()
+                                        {
+                                            start = Some(e.clone());
+                                        }
+                                    },
+                                );
+                            });
+                            let (fit_txt, fit_col) = match catalog::fit(e, ram) {
+                                Fit::Good => (
+                                    t("✔ runs well", "✔ rahat çalışır"),
+                                    egui::Color32::from_rgb(120, 210, 140),
+                                ),
+                                Fit::Tight => (t("⚠ tight", "⚠ sınırda"), crate::theme::GOLD),
+                                Fit::TooBig => {
+                                    (t("✖ too big", "✖ çok büyük"), egui::Color32::LIGHT_RED)
+                                }
+                            };
+                            ui.horizontal(|ui| {
+                                ui.small(format!("💾 {:.1} GB", e.size_gb()));
+                                ui.small(format!("RAM {:.0} GB", e.ram_gb()));
+                                ui.small(format!("VRAM {:.0} GB", e.vram_gb()));
+                                ui.small(egui::RichText::new(fit_txt).color(fit_col));
+                            });
+                            let params = if e.active_b > 0.0 {
+                                format!(
+                                    "{:.1}B ({:.1}B {})",
+                                    e.params_b,
+                                    e.active_b,
+                                    t("active", "aktif")
+                                )
+                            } else {
+                                format!("{:.1}B", e.params_b)
+                            };
+                            ui.small(
+                                egui::RichText::new(format!(
+                                    "{params} · {}K ctx · {} · {}",
+                                    e.ctx_k,
+                                    e.cat.label(),
+                                    e.repo
+                                ))
+                                .weak(),
+                            );
+                        });
+                }
+            });
+        if let Some(e) = start {
+            actions.push(LibAction::Log(format!(
+                "{} {} {} (~{:.1} GB)",
+                t("Downloading", "İndiriliyor:"),
+                e.name,
+                e.quant,
+                e.size_gb()
+            )));
+            self.downloads.push(start_catalog_download(
+                &e,
+                settings.models_dir.clone(),
+                secrets.hf_token.clone(),
+                ui.ctx().clone(),
+            ));
+        }
+    }
+
+    fn is_installed(&self, e: &Entry, settings: &Settings) -> Option<String> {
+        let _ = settings;
+        let q = e.quant.to_ascii_lowercase();
+        let stem = e
+            .repo
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .replace("-gguf", "")
+            .replace("_gguf", "");
+        let stem = stem.trim_start_matches("bartowski_").to_string();
+        self.installed
+            .iter()
+            .find(|(n, _)| {
+                let l = n.to_ascii_lowercase();
+                l.contains(&q)
+                    && (l.contains(&stem)
+                        || stem
+                            .split(['_', '-'])
+                            .filter(|w| w.len() > 2)
+                            .all(|w| l.contains(w)))
+            })
+            .map(|(n, _)| n.clone())
+    }
+
+    fn downloads_ui(&mut self, ui: &mut egui::Ui) {
+        let mut remove = None;
+        for (i, d) in self.downloads.iter().enumerate() {
+            let st = d.status.lock().unwrap().clone();
+            ui.horizontal(|ui| {
+                ui.small(&d.label);
+                if ui.small_button("✖").clicked() {
+                    d.cancel.store(true, Ordering::Relaxed);
+                    remove = Some(i);
+                }
+            });
+            match st {
+                DlStatus::Running => {
+                    let txt = format!(
+                        "{} / {}",
+                        human_size(d.done.load(Ordering::Relaxed)),
+                        human_size(d.total.load(Ordering::Relaxed))
+                    );
+                    ui.add(egui::ProgressBar::new(d.progress()).text(txt));
+                }
+                DlStatus::Failed(e) => {
+                    ui.colored_label(
+                        egui::Color32::LIGHT_RED,
+                        format!(
+                            "{e} {}",
+                            t(
+                                "(✖ to dismiss, retry resumes)",
+                                "(✖ kapat, tekrar denemek devam ettirir)"
+                            )
+                        ),
+                    );
+                }
+                DlStatus::Finished => {}
+            }
+        }
+        if let Some(i) = remove {
+            self.downloads.remove(i);
+        }
+    }
+
+    fn ui_local(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &mut Settings,
+        current: &str,
+        actions: &mut Vec<LibAction>,
+    ) {
         // Runtime
-        ui.label(egui::RichText::new("llama.cpp runtime").strong());
+        ui.label(egui::RichText::new(t("llama.cpp runtime", "llama.cpp çalışma zamanı")).strong());
         let server = Self::find_llama_server(settings);
         match &server {
             Some(p) => {
                 ui.small(format!("✔ {}", p.file_name().unwrap().to_string_lossy()));
             }
             None => {
-                ui.small("Not installed. Forge downloads the official llama.cpp build (Vulkan GPU on Windows/Linux, Metal on macOS).");
+                ui.small(t("Not installed. Forge downloads the official llama.cpp build (Vulkan GPU on Windows/Linux, Metal on macOS).", "Kurulu değil. Forge resmi llama.cpp sürümünü indirir (Windows/Linux: Vulkan GPU, macOS: Metal)."));
             }
         }
         self.runtime_progress_ui(ui);
         ui.horizontal(|ui| {
-            let busy = self.runtime_dl.as_ref().map_or(false, |d| *d.status.lock().unwrap() == DlStatus::Running);
-            if ui.add_enabled(!busy, egui::Button::new(if server.is_some() { "⟳ Update runtime" } else { "⬇ Install runtime" })).clicked() {
+            let busy = self
+                .runtime_dl
+                .as_ref()
+                .map_or(false, |d| *d.status.lock().unwrap() == DlStatus::Running);
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(if server.is_some() {
+                        t("⟳ Update runtime", "⟳ Güncelle")
+                    } else {
+                        t("⬇ Install runtime", "⬇ Çalışma zamanını kur")
+                    }),
+                )
+                .clicked()
+            {
                 self.install_runtime(settings, ui.ctx());
             }
-            if self.llama.is_some() && ui.button("■ Stop server").clicked() {
+            if self.llama.is_some() && ui.button(t("■ Stop server", "■ Sunucuyu durdur")).clicked()
+            {
                 self.stop_llama();
             }
         });
@@ -561,39 +1059,56 @@ impl Library {
             RuntimeState::Starting(m) => {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.small(format!("Loading {m}…"));
+                    ui.small(format!("{} {m}…", t("Loading", "Yükleniyor")));
                 });
             }
             RuntimeState::Ready(m) => {
-                ui.colored_label(egui::Color32::from_rgb(120, 220, 140), format!("● Serving {m} on :{LOCAL_LLAMA_PORT}"));
+                ui.colored_label(
+                    egui::Color32::from_rgb(120, 220, 140),
+                    format!("• {m} :{LOCAL_LLAMA_PORT}"),
+                );
             }
             RuntimeState::Failed(e) => {
                 ui.colored_label(egui::Color32::LIGHT_RED, e);
             }
         }
-        ui.collapsing("Runtime settings", |ui| {
+        ui.collapsing(t("Runtime settings", "Çalışma zamanı ayarları"), |ui| {
             ui.horizontal(|ui| {
-                ui.label("Context");
-                ui.add(egui::DragValue::new(&mut settings.llama_ctx).range(1024..=262144).speed(256));
+                ui.label(t("Context", "Bağlam"));
+                ui.add(
+                    egui::DragValue::new(&mut settings.llama_ctx)
+                        .range(1024..=262144)
+                        .speed(256),
+                );
             });
             ui.horizontal(|ui| {
-                ui.label("GPU layers");
+                ui.label(t("GPU layers", "GPU katmanları"));
                 ui.add(egui::DragValue::new(&mut settings.llama_gpu_layers).range(0..=999));
             });
-            ui.label("Custom llama-server path (optional)");
+            ui.label(t(
+                "Custom llama-server path (optional)",
+                "Özel llama-server yolu (isteğe bağlı)",
+            ));
             ui.text_edit_singleline(&mut settings.llama_server);
         });
 
         ui.separator();
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Installed models").strong());
-            if ui.small_button("⟳").on_hover_text("Rescan models folder").clicked() {
+            ui.label(egui::RichText::new(t("Installed models", "Kurulu modeller")).strong());
+            if ui
+                .small_button("⟳")
+                .on_hover_text(t("Rescan models folder", "Klasörü yeniden tara"))
+                .clicked()
+            {
                 self.refresh_installed(settings);
             }
         });
         ui.small(settings.models_dir.display().to_string());
         if self.installed.is_empty() {
-            ui.small("No GGUF models yet — get some from the HF Hub tab.");
+            ui.small(t(
+                "No GGUF models yet — download from the Models tab.",
+                "Henüz GGUF model yok — Modeller sekmesinden indir.",
+            ));
         }
         let mut delete = None;
         for (name, size) in self.installed.clone() {
@@ -601,16 +1116,31 @@ impl Library {
             let active = current == id;
             egui::Frame::group(ui.style()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new(&name).strong().color(if active { crate::theme::ACCENT } else { ui.visuals().text_color() }));
+                ui.label(egui::RichText::new(&name).strong().color(if active {
+                    crate::theme::ACCENT
+                } else {
+                    ui.visuals().text_color()
+                }));
                 ui.horizontal(|ui| {
                     ui.small(human_size(size));
-                    if ui.small_button(if active { "✔ In use" } else { "▶ Use" }).clicked() {
+                    if ui
+                        .small_button(if active {
+                            t("✔ In use", "✔ Kullanımda")
+                        } else {
+                            t("▶ Use", "▶ Kullan")
+                        })
+                        .clicked()
+                    {
                         match self.start_llama(settings, &name, ui.ctx()) {
                             Ok(()) => actions.push(LibAction::UseModel(id.clone())),
                             Err(e) => actions.push(LibAction::Log(e)),
                         }
                     }
-                    if ui.small_button("🗑").on_hover_text("Delete file").clicked() {
+                    if ui
+                        .small_button("🗑")
+                        .on_hover_text(t("Delete file", "Dosyayı sil"))
+                        .clicked()
+                    {
                         delete = Some(name.clone());
                     }
                 });
@@ -637,15 +1167,24 @@ impl Library {
         });
         match &*self.ollama.lock().unwrap() {
             None => {
-                ui.small("Press ⟳ to list models from a running Ollama.");
+                ui.small(t(
+                    "Press ⟳ to list models from a running Ollama.",
+                    "Çalışan Ollama modellerini listelemek için ⟳.",
+                ));
             }
             Some(Err(e)) => {
-                ui.small(format!("Ollama not reachable ({e})"));
+                ui.small(format!(
+                    "{} ({e})",
+                    t("Ollama not reachable", "Ollama erişilemiyor")
+                ));
             }
             Some(Ok(list)) => {
                 for m in list {
                     let id = format!("ollama:{m}");
-                    if ui.selectable_label(current == id, format!("Ollama · {m}")).clicked() {
+                    if ui
+                        .selectable_label(current == id, format!("Ollama · {m}"))
+                        .clicked()
+                    {
                         actions.push(LibAction::UseModel(id));
                     }
                 }
@@ -653,44 +1192,28 @@ impl Library {
         }
     }
 
-    fn ui_hub(&mut self, ui: &mut egui::Ui, settings: &mut Settings, secrets: &Secrets, actions: &mut Vec<LibAction>) {
+    fn ui_hub(
+        &mut self,
+        ui: &mut egui::Ui,
+        settings: &mut Settings,
+        secrets: &Secrets,
+        actions: &mut Vec<LibAction>,
+    ) {
         let ctx = ui.ctx().clone();
         ui.horizontal(|ui| {
-            let r = ui.add(egui::TextEdit::singleline(&mut self.query).hint_text("Search GGUF models…").desired_width(ui.available_width() - 44.0));
-            if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) | ui.button("🔍").clicked() {
+            let r = ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .hint_text(t("Search Hugging Face GGUF…", "Hugging Face GGUF ara…"))
+                    .desired_width(ui.available_width() - 44.0),
+            );
+            if (r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                | ui.button("🔍").clicked()
+            {
                 self.search(self.query.clone(), secrets.hf_token.clone(), &ctx);
             }
         });
 
-        // Active downloads
-        let mut remove = None;
-        for (i, d) in self.downloads.iter().enumerate() {
-            let st = d.status.lock().unwrap().clone();
-            ui.horizontal(|ui| {
-                ui.small(&d.label);
-                if ui.small_button("✖").clicked() {
-                    d.cancel.store(true, Ordering::Relaxed);
-                    remove = Some(i);
-                }
-            });
-            match st {
-                DlStatus::Running => {
-                    let txt = format!(
-                        "{} / {}",
-                        human_size(d.done.load(Ordering::Relaxed)),
-                        human_size(d.total.load(Ordering::Relaxed))
-                    );
-                    ui.add(egui::ProgressBar::new(d.progress()).text(txt));
-                }
-                DlStatus::Failed(e) => {
-                    ui.colored_label(egui::Color32::LIGHT_RED, format!("Failed: {e} (✖ to dismiss, retry resumes)"));
-                }
-                DlStatus::Finished => {}
-            }
-        }
-        if let Some(i) = remove {
-            self.downloads.remove(i);
-        }
+        self.downloads_ui(ui);
 
         let results = self.results.lock().unwrap().clone();
         if results.is_some() {
@@ -702,15 +1225,26 @@ impl Library {
         let list: Vec<(String, String)> = match results {
             Some(Ok(r)) => r
                 .into_iter()
-                .map(|m| (m.id, format!("⬇ {}  ♥ {}", compact(m.downloads), compact(m.likes))))
+                .map(|m| {
+                    (
+                        m.id,
+                        format!("⬇ {}  ♥ {}", compact(m.downloads), compact(m.likes)),
+                    )
+                })
                 .collect(),
             Some(Err(e)) => {
-                ui.colored_label(egui::Color32::LIGHT_RED, format!("Search failed: {e}"));
+                ui.colored_label(
+                    egui::Color32::LIGHT_RED,
+                    format!("{} {e}", t("Search failed:", "Arama başarısız:")),
+                );
                 vec![]
             }
             None => {
-                ui.label(egui::RichText::new("Featured").strong());
-                FEATURED.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect()
+                ui.label(egui::RichText::new(t("Featured", "Öne çıkanlar")).strong());
+                FEATURED
+                    .iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect()
             }
         };
         for (repo, meta) in list {
@@ -731,7 +1265,15 @@ impl Library {
         }
     }
 
-    fn ui_files(&mut self, ui: &mut egui::Ui, repo: &str, settings: &Settings, secrets: &Secrets, ctx: &egui::Context, actions: &mut Vec<LibAction>) {
+    fn ui_files(
+        &mut self,
+        ui: &mut egui::Ui,
+        repo: &str,
+        settings: &Settings,
+        secrets: &Secrets,
+        ctx: &egui::Context,
+        actions: &mut Vec<LibAction>,
+    ) {
         let files = self.files.lock().unwrap().clone();
         match files {
             None => {
@@ -742,26 +1284,49 @@ impl Library {
             }
             Some(Ok(files)) => {
                 if files.is_empty() {
-                    ui.small("No .gguf files in this repo.");
+                    ui.small(t(
+                        "No .gguf files in this repo.",
+                        "Bu depoda .gguf dosyası yok.",
+                    ));
                 }
                 for f in files {
                     let fname = f.path.rsplit('/').next().unwrap_or(&f.path).to_string();
                     let recommended = fname.to_uppercase().contains("Q4_K_M");
                     let installed = settings.models_dir.join(&fname).is_file();
                     ui.horizontal(|ui| {
-                        let mut t = egui::RichText::new(&fname).small();
+                        let mut rt = egui::RichText::new(&fname).small();
                         if recommended {
-                            t = t.color(crate::theme::GOLD);
+                            rt = rt.color(crate::theme::GOLD);
                         }
-                        ui.label(t).on_hover_text(if recommended { "Recommended quantization" } else { "" });
+                        ui.label(rt).on_hover_text(if recommended {
+                            t("Recommended quantization", "Önerilen nicemleme")
+                        } else {
+                            ""
+                        });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if installed {
                                 ui.small("✔");
-                            } else if ui.small_button("⬇").on_hover_text(human_size(f.size)).clicked() {
-                                let url = format!("https://huggingface.co/{repo}/resolve/main/{}", url_encode(&f.path));
-                                let dl = start_download(fname.clone(), url, settings.models_dir.join(&fname), secrets.hf_token.clone(), ctx.clone());
+                            } else if ui
+                                .small_button("⬇")
+                                .on_hover_text(human_size(f.size))
+                                .clicked()
+                            {
+                                let url = format!(
+                                    "https://huggingface.co/{repo}/resolve/main/{}",
+                                    url_encode(&f.path)
+                                );
+                                let dl = start_download(
+                                    fname.clone(),
+                                    url,
+                                    settings.models_dir.join(&fname),
+                                    secrets.hf_token.clone(),
+                                    ctx.clone(),
+                                );
                                 self.downloads.push(dl);
-                                actions.push(LibAction::Log(format!("Downloading {fname} ({})", human_size(f.size))));
+                                actions.push(LibAction::Log(format!(
+                                    "Downloading {fname} ({})",
+                                    human_size(f.size)
+                                )));
                             }
                             ui.small(human_size(f.size));
                         });
@@ -772,8 +1337,19 @@ impl Library {
     }
 }
 
-fn model_card(ui: &mut egui::Ui, name: &str, blurb: &str, id: &str, active: bool, mut on_use: impl FnMut()) {
-    let stroke = if active { egui::Stroke::new(1.5_f32, crate::theme::ACCENT) } else { ui.visuals().widgets.noninteractive.bg_stroke };
+fn model_card(
+    ui: &mut egui::Ui,
+    name: &str,
+    blurb: &str,
+    id: &str,
+    active: bool,
+    mut on_use: impl FnMut(),
+) {
+    let stroke = if active {
+        egui::Stroke::new(1.5_f32, crate::theme::ACCENT)
+    } else {
+        ui.visuals().widgets.noninteractive.bg_stroke
+    };
     let r = egui::Frame::group(ui.style())
         .stroke(stroke)
         .show(ui, |ui| {
@@ -781,14 +1357,21 @@ fn model_card(ui: &mut egui::Ui, name: &str, blurb: &str, id: &str, active: bool
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(name).strong());
                 if active {
-                    ui.label(egui::RichText::new("● active").small().color(crate::theme::ACCENT));
+                    ui.label(
+                        egui::RichText::new(t("• active", "• aktif"))
+                            .small()
+                            .color(crate::theme::ACCENT),
+                    );
                 }
             });
             ui.small(blurb);
             ui.label(egui::RichText::new(id).small().weak().monospace());
         })
         .response;
-    if r.interact(egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+    if r.interact(egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .clicked()
+    {
         on_use();
     }
 }
@@ -818,7 +1401,8 @@ fn find_file(dir: &Path, name: &str, depth: u32) -> Option<PathBuf> {
     if depth == 0 {
         return None;
     }
-    dirs.into_iter().find_map(|d| find_file(&d, name, depth - 1))
+    dirs.into_iter()
+        .find_map(|d| find_file(&d, name, depth - 1))
 }
 
 fn extract(archive: &Path, out: &Path) -> Result<(), String> {
@@ -829,7 +1413,9 @@ fn extract(archive: &Path, out: &Path) -> Result<(), String> {
         let mut z = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
         z.extract(out).map_err(|e| e.to_string())?;
     } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        tar::Archive::new(flate2::read::GzDecoder::new(f)).unpack(out).map_err(|e| e.to_string())?;
+        tar::Archive::new(flate2::read::GzDecoder::new(f))
+            .unpack(out)
+            .map_err(|e| e.to_string())?;
     } else {
         return Err(format!("unsupported archive {name}"));
     }

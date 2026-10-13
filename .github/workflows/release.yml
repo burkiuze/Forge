@@ -1,10 +1,19 @@
-name: build
+name: build & release
 
+# Every push to main is built for Windows, Linux and macOS and published as the GitHub
+# release `build-<run number>`. Forge checks this release on start-up and offers to update.
 on:
   push:
-    branches: [main, "claude/**"]
-    tags: ["v*"]
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  FORGE_BUILD: ${{ github.run_number }}
 
 jobs:
   test:
@@ -13,10 +22,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
       - run: cargo test --locked
 
-  windows-installer:
+  windows:
     needs: test
     runs-on: ubuntu-latest
     steps:
@@ -26,34 +35,58 @@ jobs:
           targets: x86_64-pc-windows-gnu
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y mingw-w64 nsis
-      - run: cargo build --release --locked --target x86_64-pc-windows-gnu
+      - run: FORGE_COMMIT=${GITHUB_SHA::7} cargo build --release --locked --target x86_64-pc-windows-gnu
       - run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
           mkdir -p dist
-          makensis -DVERSION=$VERSION installer/forge.nsi
-          cp target/x86_64-pc-windows-gnu/release/forge.exe dist/Forge-$VERSION-portable.exe
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          (cd installer && makensis -DVERSION=$VERSION.${{ github.run_number }} forge.nsi)
+          cp target/x86_64-pc-windows-gnu/release/forge.exe dist/Forge-portable.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: forge-windows
+          name: windows
           path: dist/*
 
   native:
     needs: test
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            asset: forge-linux-x64.tar.gz
+          - os: macos-latest
+            asset: forge-macos.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev
-      - run: cargo build --release --locked
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+      - run: FORGE_COMMIT=$(echo $GITHUB_SHA | cut -c1-7) cargo build --release --locked
       - run: |
           mkdir -p dist
-          tar -czf dist/forge-${{ runner.os }}-${{ runner.arch }}.tar.gz -C target/release forge -C ../../installer install.sh
+          tar -czf dist/${{ matrix.asset }} -C target/release forge
       - uses: actions/upload-artifact@v4
         with:
-          name: forge-${{ runner.os }}
+          name: ${{ runner.os }}
           path: dist/*
+
+  release:
+    if: github.event_name != 'pull_request'
+    needs: [windows, native]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Forge build ${{ github.run_number }}
+          body: |
+            ${{ github.event.head_commit.message }}
+
+            Windows: Forge-Setup.exe (installer) or Forge-portable.exe · Linux/macOS: tar.gz
+          files: dist/*
+          make_latest: true

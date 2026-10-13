@@ -3,15 +3,20 @@
 
 mod ai;
 mod app;
+mod assets;
+mod catalog;
 mod chat;
 mod config;
+mod i18n;
 mod library;
 mod mesh;
 mod render;
 mod runtime;
 mod scene;
+mod start;
 mod templates;
 mod theme;
+mod updater;
 mod wizard;
 
 #[cfg(test)]
@@ -20,9 +25,15 @@ mod tests;
 use std::path::PathBuf;
 
 fn icon() -> egui::IconData {
-    let img = image::load_from_memory(include_bytes!("../assets/logo.png")).expect("logo").to_rgba8();
+    let img = image::load_from_memory(include_bytes!("../assets/logo.png"))
+        .expect("logo")
+        .to_rgba8();
     let (w, h) = img.dimensions();
-    egui::IconData { rgba: img.into_raw(), width: w, height: h }
+    egui::IconData {
+        rgba: img.into_raw(),
+        width: w,
+        height: h,
+    }
 }
 
 /// `forge --play game.scene.json`, or an exported game (a `game.scene.json` next to the executable).
@@ -41,7 +52,10 @@ fn options(msaa: u16, player: bool) -> eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Forge")
             .with_app_id("forge")
-            .with_inner_size([if player { 1280.0 } else { 1600.0 }, if player { 720.0 } else { 940.0 }])
+            .with_inner_size([
+                if player { 1280.0 } else { 1600.0 },
+                if player { 720.0 } else { 940.0 },
+            ])
             .with_min_inner_size([900.0, 560.0])
             .with_icon(icon()),
         depth_buffer: 24,
