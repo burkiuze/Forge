@@ -854,15 +854,6 @@ impl Library {
                             ui.set_height(row_h - 18.0);
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(e.name).strong());
-                                let qc = if e.recommended() {
-                                    crate::theme::GOLD
-                                } else {
-                                    ui.visuals().weak_text_color()
-                                };
-                                ui.label(
-                                    egui::RichText::new(e.quant).small().monospace().color(qc),
-                                )
-                                .on_hover_text(e.note);
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -901,6 +892,15 @@ impl Library {
                                 }
                             };
                             ui.horizontal(|ui| {
+                                let qc = if e.recommended() {
+                                    crate::theme::GOLD
+                                } else {
+                                    ui.visuals().weak_text_color()
+                                };
+                                ui.label(
+                                    egui::RichText::new(e.quant).small().monospace().color(qc),
+                                )
+                                .on_hover_text(e.note);
                                 ui.small(format!("💾 {:.1} GB", e.size_gb()));
                                 ui.small(format!("RAM {:.0} GB", e.ram_gb()));
                                 ui.small(format!("VRAM {:.0} GB", e.vram_gb()));

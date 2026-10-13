@@ -163,6 +163,7 @@ pub struct ForgeApp {
     updater: Updater,
     last_frame: Instant,
     last_title: String,
+    last_update_check: Instant,
 }
 
 pub fn default_layout() -> DockState<Tab> {
@@ -258,6 +259,7 @@ impl ForgeApp {
             updater: Updater::default(),
             last_frame: Instant::now(),
             last_title: String::new(),
+            last_update_check: Instant::now(),
         };
         if !player {
             app.updater.check(&cc.egui_ctx);
@@ -1407,6 +1409,19 @@ impl eframe::App for ForgeApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             }
             return;
+        }
+
+        // While the editor is open, look for new GitHub releases every 30 minutes.
+        if self.last_update_check.elapsed().as_secs() > 30 * 60 {
+            self.last_update_check = Instant::now();
+            if matches!(
+                self.updater.state(),
+                crate::updater::UpdateState::UpToDate
+                    | crate::updater::UpdateState::Failed(_)
+                    | crate::updater::UpdateState::Idle
+            ) {
+                self.updater.check(ctx);
+            }
         }
 
         // Agent events → execute tools on the scene (destructive ones wait for approval).
