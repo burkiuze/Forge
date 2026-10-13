@@ -189,6 +189,8 @@ pub struct DrawItem {
     pub tiling: f32,
     pub unlit: bool,
     pub texture: Option<PathBuf>,
+    /// glTF/GLB file for `MeshKind::Model`.
+    pub asset: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -285,6 +287,12 @@ impl DrawList {
                 tiling: m.tiling.max(0.01),
                 unlit: m.unlit,
                 texture,
+                asset: (e.mesh == MeshKind::Model && !e.model.is_empty()).then(
+                    || match project_root {
+                        Some(r) => r.join(&e.model),
+                        None => PathBuf::from(&e.model),
+                    },
+                ),
             });
         }
         let mut lines = vec![];
@@ -638,6 +646,7 @@ pub struct GlRenderer {
     shadow_fbo: Option<glow::Framebuffer>,
     shadow_tex: Option<glow::Texture>,
     textures: HashMap<PathBuf, Option<glow::Texture>>,
+    models: HashMap<PathBuf, Option<(GpuMesh, Option<glow::Texture>)>>,
 }
 
 fn as_bytes(v: &[f32]) -> &[u8] {
@@ -776,6 +785,7 @@ impl GlRenderer {
                 shadow_fbo,
                 shadow_tex,
                 textures: HashMap::new(),
+                models: HashMap::new(),
             })
         }
     }
@@ -824,6 +834,90 @@ impl GlRenderer {
     /// Forget a cached texture (e.g. after re-import).
     pub fn invalidate_textures(&mut self) {
         self.textures.clear();
+        self.models.clear();
+    }
+
+    /// Vertex array, vertex count and built-in texture (models) for a draw item.
+    unsafe fn geometry(
+        &mut self,
+        gl: &glow::Context,
+        it: &DrawItem,
+    ) -> Option<(glow::VertexArray, i32, Option<glow::Texture>)> {
+        if it.mesh != MeshKind::Model {
+            return self.meshes.get(&it.mesh).map(|m| (m.vao, m.count, None));
+        }
+        let path = it.asset.as_ref()?;
+        if !self.models.contains_key(path) {
+            let loaded = crate::model::load(path).ok().and_then(|data| {
+                let vao = gl.create_vertex_array().ok()?;
+                let vbo = gl.create_buffer().ok()?;
+                let stride = (mesh::STRIDE * 4) as i32;
+                gl.bind_vertex_array(Some(vao));
+                gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                gl.buffer_data_u8_slice(
+                    glow::ARRAY_BUFFER,
+                    as_bytes(&data.verts),
+                    glow::STATIC_DRAW,
+                );
+                gl.enable_vertex_attrib_array(0);
+                gl.vertex_attrib_pointer_f32(0, 3, glow::FLOAT, false, stride, 0);
+                gl.enable_vertex_attrib_array(1);
+                gl.vertex_attrib_pointer_f32(1, 3, glow::FLOAT, false, stride, 12);
+                gl.enable_vertex_attrib_array(2);
+                gl.vertex_attrib_pointer_f32(2, 2, glow::FLOAT, false, stride, 24);
+                gl.bind_vertex_array(None);
+                let tex = data.texture.as_ref().and_then(|(w, h, px)| {
+                    let t = gl.create_texture().ok()?;
+                    gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                    gl.tex_image_2d(
+                        glow::TEXTURE_2D,
+                        0,
+                        glow::RGBA8 as i32,
+                        *w as i32,
+                        *h as i32,
+                        0,
+                        glow::RGBA,
+                        glow::UNSIGNED_BYTE,
+                        glow::PixelUnpackData::Slice(Some(px)),
+                    );
+                    gl.generate_mipmap(glow::TEXTURE_2D);
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MIN_FILTER,
+                        glow::LINEAR_MIPMAP_LINEAR as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_MAG_FILTER,
+                        glow::LINEAR as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_S,
+                        glow::REPEAT as i32,
+                    );
+                    gl.tex_parameter_i32(
+                        glow::TEXTURE_2D,
+                        glow::TEXTURE_WRAP_T,
+                        glow::REPEAT as i32,
+                    );
+                    Some(t)
+                });
+                Some((
+                    GpuMesh {
+                        vao,
+                        _vbo: vbo,
+                        count: (data.verts.len() / mesh::STRIDE) as i32,
+                    },
+                    tex,
+                ))
+            });
+            self.models.insert(path.clone(), loaded);
+        }
+        self.models
+            .get(path)?
+            .as_ref()
+            .map(|(m, t)| (m.vao, m.count, *t))
     }
 
     pub fn paint(&mut self, gl: &glow::Context, dl: &DrawList, info: &egui::PaintCallbackInfo) {
@@ -856,16 +950,17 @@ impl GlRenderer {
                 );
                 let u_model = gl.get_uniform_location(p, "u_model");
                 for it in dl.items.iter().filter(|i| !i.unlit) {
-                    let Some(m) = self.meshes.get(&it.mesh) else {
+                    let Some((vao, count, _)) = self.geometry(gl, it) else {
                         continue;
                     };
+                    gl.use_program(Some(p));
                     gl.uniform_matrix_4_f32_slice(
                         u_model.as_ref(),
                         false,
                         &it.model.to_cols_array(),
                     );
-                    gl.bind_vertex_array(Some(m.vao));
-                    gl.draw_arrays(glow::TRIANGLES, 0, m.count);
+                    gl.bind_vertex_array(Some(vao));
+                    gl.draw_arrays(glow::TRIANGLES, 0, count);
                 }
                 gl.disable(glow::POLYGON_OFFSET_FILL);
                 gl.bind_framebuffer(glow::FRAMEBUFFER, None);
@@ -975,10 +1070,14 @@ impl GlRenderer {
             );
             let force_unlit = dl.shading == Shading::Unlit;
             for it in &dl.items {
-                let tex = it.texture.as_ref().and_then(|t| self.texture(gl, t));
-                let Some(m) = self.meshes.get(&it.mesh) else {
+                let Some((vao, count, model_tex)) = self.geometry(gl, it) else {
                     continue;
                 };
+                let tex = it
+                    .texture
+                    .as_ref()
+                    .and_then(|t| self.texture(gl, t))
+                    .or(model_tex);
                 gl.use_program(Some(p));
                 gl.active_texture(glow::TEXTURE0);
                 gl.bind_texture(glow::TEXTURE_2D, tex);
@@ -1004,8 +1103,8 @@ impl GlRenderer {
                     it.emission[2],
                 );
                 gl.uniform_1_i32(u_unlit.as_ref(), (it.unlit || force_unlit) as i32);
-                gl.bind_vertex_array(Some(m.vao));
-                gl.draw_arrays(glow::TRIANGLES, 0, m.count);
+                gl.bind_vertex_array(Some(vao));
+                gl.draw_arrays(glow::TRIANGLES, 0, count);
             }
             if dl.shading == Shading::Wireframe {
                 gl.polygon_mode(glow::FRONT_AND_BACK, glow::FILL);

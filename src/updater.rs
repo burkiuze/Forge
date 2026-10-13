@@ -182,7 +182,7 @@ impl Updater {
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
                 let file = dir.join(&name);
-                let resp = ureq::AgentBuilder::new()
+                let resp = crate::ai::client::builder()
                     .redirects(8)
                     .build()
                     .get(&url)
@@ -228,11 +228,27 @@ impl Updater {
                 .arg("/S")
                 .arg("/RUN")
                 .spawn();
-        } else if let Ok(exe) = std::env::current_exe() {
+        } else if let Some(exe) = launch_path() {
             let _ = std::process::Command::new(exe).spawn();
         }
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     }
+}
+
+/// The executable to relaunch. After a self-replace the running image was renamed to
+/// `*.old`, so `current_exe()` points there; the new build lives at the original name.
+fn launch_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let s = exe.to_string_lossy();
+    let base = s.strip_suffix(" (deleted)").unwrap_or(&s);
+    let base = base.strip_suffix(".old").unwrap_or(base);
+    let p = PathBuf::from(base);
+    // `forge.old` came from `forge` (no extension) or `Forge.exe` (with_extension("old")).
+    if p.is_file() {
+        return Some(p);
+    }
+    let exe_name = p.with_extension(std::env::consts::EXE_EXTENSION);
+    exe_name.is_file().then_some(exe_name)
 }
 
 /// Put the downloaded build in place (self-replace for portable / Unix copies).

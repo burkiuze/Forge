@@ -220,6 +220,7 @@ fn agents_build_scene_end_to_end() {
         },
         session_id: "test".into(),
         summary: String::new(),
+        project_root: std::env::temp_dir(),
     };
     let h = agent::spawn(job, egui::Context::default());
     let mut roles = vec![];
@@ -381,4 +382,76 @@ fn every_ui_glyph_exists_in_the_fonts() {
         }
     });
     assert!(missing.is_empty(), "glyphs without a font: {missing:?}");
+}
+
+#[test]
+fn store_parses_catalogs() {
+    use crate::store::*;
+    let ph = json!({
+        "rock_wall_08": {"name": "Rock Wall 08", "type": 1, "tags": ["rock", "wall"], "download_count": 50},
+        "wood_floor": {"name": "Wood Floor", "type": 1, "tags": ["wood"], "download_count": 90, "thumbnail_url": "https://cdn.example/wood.png"}
+    });
+    let items = parse_polyhaven(Kind::Textures, &ph).unwrap();
+    assert_eq!(items[0].id, "wood_floor");
+    assert!(items[1].thumb.contains("rock_wall_08"));
+    assert!(matches(&items[1], "rock"));
+    let files = json!({"Diffuse": {"1k": {"jpg": {"url": "https://dl.polyhaven.org/x_diff_1k.jpg"}}}, "nor_gl": {}});
+    assert_eq!(
+        ph_diffuse_url(&files).unwrap(),
+        "https://dl.polyhaven.org/x_diff_1k.jpg"
+    );
+    let acg = json!({"foundAssets": [{"assetId": "Bricks076", "displayName": "Bricks 076", "previewImage": {"128-PNG": "a", "256-PNG": "https://acg/256.png"}, "tags": ["brick"]}]});
+    let a = parse_ambientcg(&acg);
+    assert_eq!(a[0].id, "Bricks076");
+    assert_eq!(a[0].thumb, "https://acg/256.png");
+}
+
+#[test]
+fn loads_and_normalizes_gltf() {
+    // A 2×4×1 box corner triangle pair, embedded as base64.
+    let pos: [f32; 9] = [0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 4.0, 1.0];
+    let bytes: Vec<u8> = pos.iter().flat_map(|f| f.to_le_bytes()).collect();
+    use base64_lite::encode;
+    let gltf = json!({
+        "asset": {"version": "2.0"},
+        "scene": 0, "scenes": [{"nodes": [0]}],
+        "nodes": [{"mesh": 0, "translation": [10.0, 0.0, 0.0]}],
+        "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+        "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0.0, 0.0, 0.0], "max": [2.0, 4.0, 1.0]}],
+        "bufferViews": [{"buffer": 0, "byteLength": 36}],
+        "buffers": [{"byteLength": 36, "uri": format!("data:application/octet-stream;base64,{}", encode(&bytes))}]
+    });
+    let p = std::env::temp_dir().join(format!("forge-tri-{}.gltf", std::process::id()));
+    std::fs::write(&p, gltf.to_string()).unwrap();
+    let m = crate::model::load(&p).unwrap();
+    assert_eq!(m.verts.len(), 3 * crate::mesh::STRIDE);
+    assert!(
+        (m.extents - glam::Vec3::new(2.0, 4.0, 1.0)).length() < 1e-4,
+        "{}",
+        m.extents
+    );
+    for v in m.verts.chunks(crate::mesh::STRIDE) {
+        assert!(v[0].abs() <= 0.5001 && v[1].abs() <= 0.5001 && v[2].abs() <= 0.5001);
+    }
+    let _ = std::fs::remove_file(p);
+}
+
+mod base64_lite {
+    pub fn encode(b: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut s = String::new();
+        for c in b.chunks(3) {
+            let n = (c[0] as u32) << 16
+                | (*c.get(1).unwrap_or(&0) as u32) << 8
+                | *c.get(2).unwrap_or(&0) as u32;
+            for i in 0..4 {
+                if i <= c.len() {
+                    s.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    s.push('=');
+                }
+            }
+        }
+        s
+    }
 }

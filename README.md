@@ -12,6 +12,8 @@
 | ![Start](docs/screenshots/start-screen.png) | ![Wizard](docs/screenshots/setup-wizard.png) |
 | **Inspector + gizmo** | **Yerel model kataloğu** |
 | ![Inspector](docs/screenshots/inspector.png) | ![Models](docs/screenshots/model-catalog.png) |
+| **Varlık Mağazası (CC0)** | |
+| ![Asset Store](docs/screenshots/asset-store.png) | |
 
 ## Özellikler
 
@@ -30,6 +32,12 @@
 - 💭 **Ajan hafızası**: [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory). Memory Core (`:8420`) ile `/v3/conversation/add` (yazma) ve `/v3/atomic/search` (hatırlama) kullanılır. Bağlantı yoksa yerleşik çevrimdışı BM25 hafızası devreye girer.
 - "Düşündü: Xs" adımları, araç satırları, kaynak bağlantıları, İyi/Kötü geri bildirimi, "N değişiklik · İncele · Geri al" çubuğu
 - `@` ile nesne anma, `/level /game /script /light /fix /explain /search` iş akışları
+
+**Varlık Mağazası: ücretsiz CC0 varlıklar**
+- **Poly Haven**: dokular ve glTF 3D modeller. **ambientCG**: 2000+ PBR malzeme. Arama, küçük resimler, tek tıkla projeye indirme, "Seçiliye uygula" ve "Sahneye koy".
+- glTF/GLB model desteği: gerçek boyutta, dokulu, gölgeli. İçerik Tarayıcı'dan çift tıkla veya sahneye sürükle.
+- Ajan da kullanabilir: `asset_search` / `asset_import` ("zemine ahşap doku bul ve uygula", "sahneye bir sandık koy").
+- Kenney, Quaternius, Poly Pizza, OpenGameArt, itch.io ve Freesound bağlantıları (bunların API'si yok; indirdiğin paketi İçe aktar ile eklersin).
 
 **Modeller**
 - Bulut (OpenRouter, ücretsiz): **Auto**, Gemma 4 31B, Mercury Decide, North Mini Code, Inkling Small, ayrıca istediğin model kimliği

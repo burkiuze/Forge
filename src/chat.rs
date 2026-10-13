@@ -1026,6 +1026,8 @@ fn tool_verb(name: &str) -> (&'static str, &'static str) {
         "task" | "ask_coder" => ("🔭", t("Delegated", "Devredildi")),
         "todo_write" => ("☰", t("Planned", "Planlandı")),
         "remember" => ("💭", t("Remembered", "Hatırlandı")),
+        "asset_search" => ("📦", t("Browsed assets", "Varlık arandı")),
+        "asset_import" => ("⬇", t("Imported", "İçe aktarıldı")),
         _ => ("✏", t("Edited", "Düzenlendi")),
     }
 }

@@ -124,6 +124,8 @@ pub struct Job {
     pub session_id: String,
     /// Summary of older turns (opencode-style compaction).
     pub summary: String,
+    /// Project folder (asset imports land here).
+    pub project_root: std::path::PathBuf,
 }
 
 pub struct AgentHandle {
@@ -344,6 +346,38 @@ impl Orchestrator {
                 .map(|_| "stored".into()),
             "ask_coder" => self.coder(call),
             "task" => self.subagent(&arg("agent"), &arg("prompt")),
+            "asset_search" if !self.job.web => {
+                Err("web access is disabled in the Agent panel (🌐)".into())
+            }
+            "asset_search" => crate::store::search(
+                crate::store::Source::parse(&arg("source")),
+                crate::store::Kind::parse(&arg("kind")),
+                &arg("query"),
+                12,
+            )
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|i| {
+                        format!(
+                            "- id={} name=\"{}\" source={} kind={:?} tags={}",
+                            i.id,
+                            i.name,
+                            i.source.label(),
+                            i.kind,
+                            i.tags.join(",")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+            "asset_import" => crate::store::import(
+                crate::store::Source::parse(&arg("source")),
+                crate::store::Kind::parse(&arg("kind")),
+                &arg("id"),
+                &self.job.project_root,
+            )
+            .map(|imp| serde_json::to_string(&imp).unwrap_or_default()),
             "todo_write" => {
                 let todos: Vec<(String, String)> = call.args["todos"]
                     .as_array()

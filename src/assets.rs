@@ -3,7 +3,7 @@
 use image::{Rgba, RgbaImage};
 use std::path::{Path, PathBuf};
 
-pub const FOLDERS: [&str; 3] = ["Scripts", "Textures", "Prefabs"];
+pub const FOLDERS: [&str; 4] = ["Scripts", "Textures", "Prefabs", "Models"];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AssetKind {
@@ -12,6 +12,7 @@ pub enum AssetKind {
     Script,
     Texture,
     Prefab,
+    Model,
     Other,
 }
 
@@ -28,6 +29,8 @@ impl AssetKind {
             AssetKind::Prefab
         } else if n.ends_with(".scene.json") || n.ends_with(".json") {
             AssetKind::Scene
+        } else if n.ends_with(".gltf") || n.ends_with(".glb") {
+            AssetKind::Model
         } else if n.ends_with(".rhai") {
             AssetKind::Script
         } else if n.ends_with(".png") || n.ends_with(".jpg") || n.ends_with(".jpeg") {
@@ -43,6 +46,7 @@ impl AssetKind {
             AssetKind::Script => "📜",
             AssetKind::Texture => "🖼",
             AssetKind::Prefab => "📦",
+            AssetKind::Model => "🗿",
             AssetKind::Other => "📄",
         }
     }

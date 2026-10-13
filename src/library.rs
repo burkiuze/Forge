@@ -196,7 +196,7 @@ fn fetch_to(
         dest.extension().and_then(|e| e.to_str()).unwrap_or("bin")
     ));
     let existing = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    let agent = ureq::AgentBuilder::new()
+    let agent = crate::ai::client::builder()
         .timeout_connect(std::time::Duration::from_secs(20))
         .timeout_read(std::time::Duration::from_secs(60))
         .build();

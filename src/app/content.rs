@@ -236,6 +236,7 @@ impl Editor {
                                         AssetKind::Script => Color32::from_rgb(120, 190, 240),
                                         AssetKind::Scene => ACCENT,
                                         AssetKind::Prefab => Color32::from_rgb(130, 210, 160),
+                                        AssetKind::Model => Color32::from_rgb(190, 160, 230),
                                         _ => theme::BONE,
                                     };
                                     ui.painter().text(
@@ -334,6 +335,17 @@ impl Editor {
                 }
                 (0, AssetKind::Scene) => self.open_scene(p),
                 (0, AssetKind::Prefab) => self.instantiate_prefab(&p),
+                (0, AssetKind::Model) | (1, AssetKind::Model) => {
+                    let rel = p
+                        .strip_prefix(&root)
+                        .map(|x| x.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    let name = p
+                        .file_stem()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    self.add_model(&rel, &name, None, None);
+                }
                 (0, AssetKind::Script) | (1, AssetKind::Script) | (1, AssetKind::Texture) => {
                     self.apply_asset(&p)
                 }

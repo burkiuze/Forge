@@ -39,8 +39,37 @@ pub struct Reply {
     pub model: String,
 }
 
-pub fn agent() -> ureq::Agent {
+/// TLS roots = Mozilla's webpki roots + the OS certificate store, so HTTPS works behind
+/// corporate proxies / antivirus that inject their own CA.
+pub fn tls() -> std::sync::Arc<rustls::ClientConfig> {
+    static CFG: std::sync::OnceLock<std::sync::Arc<rustls::ClientConfig>> =
+        std::sync::OnceLock::new();
+    CFG.get_or_init(|| {
+        let mut roots = rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let native = rustls_native_certs::load_native_certs();
+        roots.add_parsable_certificates(native.certs);
+        let cfg = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("tls versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        std::sync::Arc::new(cfg)
+    })
+    .clone()
+}
+
+/// Shared HTTP agent builder: system proxy (HTTPS_PROXY/ALL_PROXY) + combined TLS roots.
+pub fn builder() -> ureq::AgentBuilder {
     ureq::AgentBuilder::new()
+        .tls_config(tls())
+        .try_proxy_from_env(true)
+}
+
+pub fn agent() -> ureq::Agent {
+    builder()
         .timeout_connect(Duration::from_secs(15))
         .timeout_read(Duration::from_secs(180))
         .user_agent(concat!("Forge/", env!("CARGO_PKG_VERSION")))

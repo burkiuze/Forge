@@ -25,7 +25,7 @@ impl MeshData {
 
 pub fn build(kind: MeshKind) -> MeshData {
     match kind {
-        MeshKind::None => MeshData::new(),
+        MeshKind::None | MeshKind::Model => MeshData::new(),
         MeshKind::Cube => cube(),
         MeshKind::Sphere => sphere(32, 20, 0.5, 0.0),
         MeshKind::Plane => plane(),
@@ -166,7 +166,7 @@ fn cylinder(seg: usize, r_bottom: f32, r_top: f32) -> MeshData {
 /// Triangle count per primitive (for the Stats overlay).
 pub fn triangles(kind: MeshKind) -> usize {
     match kind {
-        MeshKind::None => 0,
+        MeshKind::None | MeshKind::Model => 0,
         MeshKind::Cube => 12,
         MeshKind::Plane => 200,
         MeshKind::Sphere | MeshKind::Capsule => 32 * 20 * 2,

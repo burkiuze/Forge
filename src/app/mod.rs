@@ -39,6 +39,7 @@ pub enum Tab {
     Content,
     Console,
     Script,
+    Store,
 }
 
 impl Tab {
@@ -66,6 +67,7 @@ impl Tab {
             Tab::Content => format!("📁 {}", t("Content Browser", "İçerik Tarayıcı")),
             Tab::Console => format!("🖥 {}", t("Console", "Konsol")),
             Tab::Script => format!("📜 {}", t("Script", "Betik")),
+            Tab::Store => format!("📦 {}", t("Asset Store", "Varlık Mağazası")),
         }
     }
 }
@@ -130,6 +132,7 @@ pub struct Editor {
     pub console_search: String,
     pub chat: ChatPanel,
     pub library: Library,
+    pub store: crate::store::Store,
     pub dialogs: Dialogs,
     pub gizmo: Option<GizmoDrag>,
     pub tool: Tool,
@@ -175,8 +178,11 @@ pub fn default_layout() -> DockState<Tab> {
         vec![Tab::Inspector, Tab::Lighting, Tab::ProjectSettings],
     );
     let [center, _left] = surf.split_left(center, 0.28, vec![Tab::Hierarchy, Tab::Library]);
-    let [_center, _bottom] =
-        surf.split_below(center, 0.68, vec![Tab::Content, Tab::Console, Tab::Script]);
+    let [_center, _bottom] = surf.split_below(
+        center,
+        0.68,
+        vec![Tab::Content, Tab::Store, Tab::Console, Tab::Script],
+    );
     dock
 }
 
@@ -228,6 +234,7 @@ impl ForgeApp {
             console_search: String::new(),
             chat,
             library,
+            store: Default::default(),
             dialogs: Dialogs::default(),
             gizmo: None,
             tool: Tool::Move,
@@ -506,6 +513,44 @@ impl Editor {
         }
     }
 
+    pub fn apply_texture(&mut self, rel: &str) {
+        let Some(id) = self.selected else { return };
+        self.push_undo();
+        if let Some(e) = self.scene.get_mut(id) {
+            e.material.texture = rel.to_string();
+            e.color = [1.0, 1.0, 1.0];
+        }
+        if let Some(r) = &self.renderer {
+            r.lock().unwrap().invalidate_textures();
+        }
+    }
+
+    /// Place an imported glTF model (project-relative path) in front of the camera.
+    pub fn add_model(
+        &mut self,
+        rel: &str,
+        name: &str,
+        extents: Option<[f32; 3]>,
+        color: Option<[f32; 3]>,
+    ) {
+        let extents = extents.or_else(|| {
+            crate::model::load(&self.project_root().join(rel))
+                .ok()
+                .map(|d| d.extents.to_array())
+        });
+        let Some(ext) = extents else {
+            self.log(LogLevel::Error, format!("Cannot load model {rel}"));
+            return;
+        };
+        let id = self.create(name, MeshKind::Model);
+        let e = self.scene.get_mut(id).unwrap();
+        e.model = rel.to_string();
+        e.transform.scale = Vec3::from(ext);
+        e.transform.position.y = ext[1] * 0.5;
+        e.color = color.unwrap_or([1.0, 1.0, 1.0]);
+        e.material.roughness = 0.7;
+    }
+
     // ------------------------------------------------------------ play mode
 
     pub fn play(&mut self) {
@@ -634,6 +679,7 @@ impl Editor {
             memory: self.settings.memory.clone(),
             session_id: self.chat.conv.id.clone(),
             summary: self.chat.summary(),
+            project_root: self.project_root(),
         };
         self.chat.start(job, ctx);
     }
@@ -1290,6 +1336,20 @@ impl TabViewer for Editor {
             Tab::Content => self.content_ui(ui),
             Tab::Console => self.console_ui(ui),
             Tab::Script => self.script_ui(ui),
+            Tab::Store => {
+                let root = self.project_root();
+                crate::assets::ensure_project(&root);
+                let actions = self.store.ui(ui, &root, self.selected.is_some());
+                for a in actions {
+                    match a {
+                        crate::store::StoreAction::ApplyTexture(path) => self.apply_texture(&path),
+                        crate::store::StoreAction::AddModel(imp, name) => {
+                            self.add_model(&imp.path, &name, imp.extents, imp.color)
+                        }
+                        crate::store::StoreAction::Log(m) => self.log(LogLevel::Info, m),
+                    }
+                }
+            }
         }
     }
 

@@ -15,6 +15,8 @@ pub enum MeshKind {
     Cylinder,
     Cone,
     Capsule,
+    /// Imported glTF/GLB model (see `Entity::model`).
+    Model,
 }
 
 impl MeshKind {
@@ -36,6 +38,7 @@ impl MeshKind {
             MeshKind::Cylinder => "Cylinder",
             MeshKind::Cone => "Cone",
             MeshKind::Capsule => "Capsule",
+            MeshKind::Model => "Model",
         }
     }
     pub fn parse(s: &str) -> MeshKind {
@@ -46,6 +49,7 @@ impl MeshKind {
             "cylinder" => MeshKind::Cylinder,
             "cone" => MeshKind::Cone,
             "capsule" => MeshKind::Capsule,
+            "model" | "gltf" | "glb" => MeshKind::Model,
             _ => MeshKind::None,
         }
     }
@@ -218,6 +222,8 @@ pub struct Entity {
     pub mesh: MeshKind,
     pub color: [f32; 3],
     pub material: Material,
+    /// Project-relative path of a glTF/GLB file when `mesh == Model`.
+    pub model: String,
     pub layer: String,
     pub is_static: bool,
     pub collider: bool,
@@ -241,6 +247,7 @@ impl Default for Entity {
             mesh: MeshKind::None,
             color: [0.8, 0.8, 0.8],
             material: Material::default(),
+            model: String::new(),
             layer: "Default".into(),
             is_static: false,
             collider: true,
@@ -601,6 +608,7 @@ impl Scene {
                     o.insert("material".into(), serde_json::json!({"metallic": e.material.metallic, "roughness": e.material.roughness, "emission": e.material.emission_strength, "texture": e.material.texture}));
                 }
                 if e.layer != "Default" { o.insert("layer".into(), e.layer.clone().into()); }
+                if !e.model.is_empty() { o.insert("model".into(), e.model.clone().into()); }
                 if let Some(c) = &e.camera { o.insert("camera".into(), serde_json::json!({"fov": c.fov, "follow": c.follow})); }
                 if !e.script.is_empty() { o.insert("script_lines".into(), e.script.lines().count().into()); }
                 v

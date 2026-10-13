@@ -626,6 +626,26 @@ impl Editor {
                 }
             }
             AssetKind::Scene => self.open_scene(path.to_path_buf()),
+            AssetKind::Model => {
+                let rel = path
+                    .strip_prefix(self.project_root())
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_default();
+                let name = path
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                self.add_model(&rel, &name, None, None);
+                if let (Some((o, d)), Some(sel)) = (ray, self.selected) {
+                    if d.y.abs() > 1e-3 && -o.y / d.y > 0.0 {
+                        let hit = o + d * (-o.y / d.y);
+                        if let Some(e) = self.scene.get_mut(sel) {
+                            e.transform.position.x = hit.x;
+                            e.transform.position.z = hit.z;
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }

@@ -33,6 +33,8 @@ Available tools:
 - task {agent:"explore"|"coder", prompt} -> run a subagent (explore = read-only research; coder = writes scripts) and get its report.
 - list_files {path:"Scripts"} · read_file {path} · write_file {path, content} · grep {pattern} -> project files (paths relative to the project folder).
 - set_script also accepts {target, file:"Scripts/player.rhai"} to attach a script file.
+- asset_search {source:"polyhaven|ambientcg", kind:"textures|models", query} -> free CC0 assets (Poly Haven has textures + 3D models, ambientCG has PBR materials).
+- asset_import {source, kind, id} -> downloads into the project; returns {path, extents}. Then use the texture with update_entity {material:{texture: path}} (set color "#ffffff"), or place a model with create_entity {mesh:"model", model: path, scale: extents}.
 
 World: +Y is up, +X is right, -Z is forward (away from the default camera). Units ≈ meters. A unit cube is 1×1×1 centered on its position, so a cube resting on the ground at y=0 has position.y = scale.y/2. Planes are 1×1 (scale them, e.g. [30,1,30]).
 "##;
@@ -222,6 +224,10 @@ fn apply_fields(scene: &mut Scene, id: EntityId, a: &Value) -> Result<(), String
     if let Some(b) = a.get("trigger").and_then(|b| b.as_bool()) {
         e.trigger = b;
     }
+    if let Some(m) = a.get("model").and_then(|s| s.as_str()) {
+        e.model = m.to_string();
+        e.mesh = MeshKind::Model;
+    }
     if let Some(s) = a.get("script").and_then(|s| s.as_str()) {
         e.script = s.to_string();
     }
@@ -354,6 +360,7 @@ pub fn is_mutation(name: &str) -> bool {
             | "remember"
             | "task"
             | "todo_write"
+            | "asset_search"
     )
 }
 

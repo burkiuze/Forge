@@ -17,11 +17,15 @@ ureq = { version = "2", features = ["json"] }
 dirs = "6"
 dotenvy = "0.15"
 zip = { version = "2", default-features = false, features = ["deflate"] }
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 flate2 = "1"
 tar = "0.4"
 egui_dock = { version = "0.16", default-features = false }
 sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+gltf = { version = "1", default-features = false, features = ["import", "utils", "names"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+rustls-native-certs = "0.8"
 
 [build-dependencies]
 winresource = "0.1"
