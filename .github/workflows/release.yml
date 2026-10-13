@@ -1,0 +1,59 @@
+name: build
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev
+      - run: cargo test --locked
+
+  windows-installer:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y mingw-w64 nsis
+      - run: cargo build --release --locked --target x86_64-pc-windows-gnu
+      - run: |
+          VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          mkdir -p dist
+          makensis -DVERSION=$VERSION installer/forge.nsi
+          cp target/x86_64-pc-windows-gnu/release/forge.exe dist/Forge-$VERSION-portable.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forge-windows
+          path: dist/*
+
+  native:
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libgl1-mesa-dev
+      - run: cargo build --release --locked
+      - run: |
+          mkdir -p dist
+          tar -czf dist/forge-${{ runner.os }}-${{ runner.arch }}.tar.gz -C target/release forge -C ../../installer install.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: forge-${{ runner.os }}
+          path: dist/*
