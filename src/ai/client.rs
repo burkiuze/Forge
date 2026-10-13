@@ -68,6 +68,60 @@ pub fn builder() -> ureq::AgentBuilder {
         .try_proxy_from_env(true)
 }
 
+/// Should `url` bypass the proxy? Local services (llama.cpp, Ollama, Memory Core) and NO_PROXY hosts.
+pub fn bypass_proxy(url: &str) -> bool {
+    let host = url
+        .split("://")
+        .nth(1)
+        .unwrap_or(url)
+        .split(['/', '?'])
+        .next()
+        .unwrap_or("");
+    let host = host
+        .rsplit_once(':')
+        .filter(|(h, p)| !h.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+        .map(|(h, _)| h)
+        .unwrap_or(host);
+    let host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if host == "localhost" || host == "::1" || host.starts_with("127.") || host == "0.0.0.0" {
+        return true;
+    }
+    let no_proxy = std::env::var("NO_PROXY")
+        .or_else(|_| std::env::var("no_proxy"))
+        .unwrap_or_default();
+    no_proxy
+        .split(',')
+        .map(|e| {
+            e.trim()
+                .trim_start_matches('*')
+                .trim_start_matches('.')
+                .to_ascii_lowercase()
+        })
+        .filter(|e| !e.is_empty())
+        .any(|e| e == "*" || host == e || host.ends_with(&format!(".{e}")))
+}
+
+/// Builder for a specific URL (proxy only when the host is not local / NO_PROXY).
+pub fn builder_for(url: &str) -> ureq::AgentBuilder {
+    if bypass_proxy(url) {
+        ureq::AgentBuilder::new().tls_config(tls())
+    } else {
+        builder()
+    }
+}
+
+/// Agent with the default timeouts for `url`.
+pub fn agent_for(url: &str) -> ureq::Agent {
+    builder_for(url)
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(180))
+        .user_agent(concat!("Forge/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
 pub fn agent() -> ureq::Agent {
     builder()
         .timeout_connect(Duration::from_secs(15))
@@ -99,7 +153,7 @@ pub fn stream_chat(
         "stream": true,
         "temperature": temperature,
     });
-    let mut req = agent()
+    let mut req = agent_for(&ep.base)
         .post(&format!("{}/chat/completions", ep.base))
         .set("Content-Type", "application/json")
         .set("HTTP-Referer", "https://github.com/burkiuze/Forge")

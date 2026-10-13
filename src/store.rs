@@ -89,7 +89,7 @@ const UA: &str = concat!(
 );
 
 fn get_bytes(url: &str, limit: u64) -> Result<Vec<u8>, String> {
-    let r = crate::ai::client::builder()
+    let r = crate::ai::client::builder_for(url)
         .timeout_connect(std::time::Duration::from_secs(15))
         .timeout_read(std::time::Duration::from_secs(90))
         .redirects(8)

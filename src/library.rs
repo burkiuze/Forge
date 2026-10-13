@@ -145,7 +145,7 @@ pub enum LibAction {
 }
 
 fn get_json(url: &str, token: &str) -> Result<Value, String> {
-    let mut r = client::agent().get(url);
+    let mut r = client::agent_for(url).get(url);
     if !token.is_empty() {
         r = r.set("Authorization", &format!("Bearer {token}"));
     }
@@ -196,7 +196,7 @@ fn fetch_to(
         dest.extension().and_then(|e| e.to_str()).unwrap_or("bin")
     ));
     let existing = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    let agent = crate::ai::client::builder()
+    let agent = crate::ai::client::builder_for(url)
         .timeout_connect(std::time::Duration::from_secs(20))
         .timeout_read(std::time::Duration::from_secs(60))
         .build();
@@ -610,7 +610,7 @@ impl Library {
                 if *state.lock().unwrap() == RuntimeState::Stopped {
                     return;
                 }
-                if let Ok(r) = client::agent().get(&url).call() {
+                if let Ok(r) = client::agent_for(&url).get(&url).call() {
                     if r.status() == 200 {
                         *state.lock().unwrap() = RuntimeState::Ready(mf);
                         ctx.request_repaint();

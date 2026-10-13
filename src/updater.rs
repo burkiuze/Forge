@@ -74,7 +74,7 @@ fn fetch_latest() -> Result<Release, String> {
     // FORGE_UPDATE_API overrides the endpoint (testing / mirrors).
     let url = std::env::var("FORGE_UPDATE_API")
         .unwrap_or_else(|_| format!("https://api.github.com/repos/{REPO}/releases/latest"));
-    let r = crate::ai::client::agent()
+    let r = crate::ai::client::agent_for(&url)
         .get(&url)
         .set("Accept", "application/vnd.github+json")
         .call();
@@ -182,7 +182,7 @@ impl Updater {
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
                 let file = dir.join(&name);
-                let resp = crate::ai::client::builder()
+                let resp = crate::ai::client::builder_for(&url)
                     .redirects(8)
                     .build()
                     .get(&url)

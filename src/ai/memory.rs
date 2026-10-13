@@ -98,7 +98,7 @@ impl Memory {
     // ---------------------------------------------------------------- TencentDB Agent Memory
 
     fn post(&self, path: &str, body: Value) -> Result<Value, String> {
-        let mut req = crate::ai::client::agent()
+        let mut req = crate::ai::client::agent_for(&self.cfg.url)
             .post(&format!("{}{}", self.cfg.url.trim_end_matches('/'), path))
             .set("Content-Type", "application/json")
             .set("x-tdai-service-id", &self.cfg.service_id)
@@ -126,7 +126,7 @@ impl Memory {
             MemoryBackend::Off => Ok("off".into()),
             MemoryBackend::Builtin => Ok(format!("built-in · {} records", self.load().len())),
             MemoryBackend::TencentDb => {
-                let r = crate::ai::client::agent()
+                let r = crate::ai::client::agent_for(&self.cfg.url)
                     .get(&format!("{}/health", self.cfg.url.trim_end_matches('/')))
                     .call()
                     .map_err(|e| e.to_string())?;

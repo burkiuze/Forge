@@ -13,7 +13,7 @@ pub struct SearchHit {
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 Forge";
 
 fn get(url: &str) -> Result<String, String> {
-    let agent = crate::ai::client::builder()
+    let agent = crate::ai::client::builder_for(url)
         .timeout_connect(std::time::Duration::from_secs(10))
         .timeout_read(std::time::Duration::from_secs(20))
         .redirects(5)

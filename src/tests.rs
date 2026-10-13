@@ -455,3 +455,12 @@ mod base64_lite {
         s
     }
 }
+
+#[test]
+fn local_hosts_bypass_proxy() {
+    use crate::ai::client::bypass_proxy;
+    assert!(bypass_proxy("http://127.0.0.1:8089/v1"));
+    assert!(bypass_proxy("http://localhost:11434/v1"));
+    assert!(bypass_proxy("http://[::1]:8420"));
+    assert!(!bypass_proxy("https://openrouter.ai/api/v1"));
+}
