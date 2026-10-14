@@ -18,7 +18,7 @@ InstallDir "$LOCALAPPDATA\Programs\Forge"
 InstallDirRegKey HKCU "Software\Forge" "InstallDir"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
-BrandingText "Forge — AI-native game engine"
+BrandingText "Forge · made by burkiuze"
 
 !define MUI_ICON "..\assets\forge.ico"
 !define MUI_UNICON "..\assets\forge.ico"
