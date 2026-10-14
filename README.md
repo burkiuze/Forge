@@ -49,7 +49,7 @@
 - Kenney, Quaternius, Poly Pizza, OpenGameArt, itch.io ve Freesound bağlantıları (bunların API'si yok; indirdiğin paketi İçe aktar ile eklersin).
 
 **Modeller**
-- Bulut (OpenRouter, ücretsiz): **Auto**, Gemma 4 31B, Mercury Decide, North Mini Code, Inkling Small, ayrıca istediğin model kimliği
+- Bulut (OpenRouter, ücretsiz): **Auto** (Nemotron 3 Super → Ultra → Gemma 4 sırasıyla, meşgul olana geçer), Nemotron 3 Super, Nemotron 3 Ultra, Gemma 4 31B, ayrıca istediğin model kimliği
 - **Yerel katalog: 624 GGUF varyantı** (Llama, Qwen 2.5/3, Gemma 2/3/3n, Phi, Mistral, DeepSeek, gpt-oss, Granite…). Her varyant için disk boyutu, RAM ve VRAM gereksinimi ile "bilgisayarına uygun mu" göstergesi var. Tek tıkla indirilir; indirme yarıda kalırsa devam eder, bölünmüş dosyalar desteklenir.
 - llama.cpp çalışma zamanı tek tıkla kurulur (Vulkan / Metal), Ollama desteklenir
 

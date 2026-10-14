@@ -270,7 +270,7 @@ impl Wizard {
         });
         for (icon, t, d) in [
             ("✨", t("Forge AI agents", "Forge AI ajanları"), t("Planner, Builder, Coder, Explore and Reviewer agents build your scene, with web search and long-term memory.", "Planner, Builder, Coder, Explore ve Reviewer ajanları web araması ve uzun süreli hafızayla sahneni kurar.")),
-            ("☁", t("Cloud models", "Bulut modelleri"), "Auto, Gemma 4, Mercury Decide, North Mini Code, Inkling Small…"),
+            ("☁", t("Cloud models", "Bulut modelleri"), "Auto, Nemotron 3 Super / Ultra, Gemma 4…"),
             ("💻", t("Local models", "Yerel modeller"), t("400+ GGUF models with size and hardware requirements, run offline with llama.cpp.", "Boyut ve donanım gereksinimiyle 400+ GGUF model, llama.cpp ile internetsiz çalıştır.")),
             ("▶", t("Play instantly", "Anında oyna"), t("Rhai scripts, physics, shadows and one-click Play mode.", "Rhai betikleri, fizik, gölgeler ve tek tıkla Play modu.")),
         ] {

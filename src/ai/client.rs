@@ -147,12 +147,16 @@ pub fn stream_chat(
         .iter()
         .map(|m| json!({"role": m.role, "content": m.content}))
         .collect();
-    let body = json!({
+    let mut body = json!({
         "model": ep.model,
         "messages": msgs,
         "stream": true,
         "temperature": temperature,
     });
+    if ep.backend == super::models::Backend::OpenRouter && ep.model == super::models::AUTO_ID {
+        body["model"] = json!(super::models::AUTO_MODELS[0]);
+        body["models"] = json!(super::models::AUTO_MODELS);
+    }
     let mut req = agent_for(&ep.base)
         .post(&format!("{}/chat/completions", ep.base))
         .set("Content-Type", "application/json")

@@ -52,7 +52,7 @@ pub struct Settings {
     pub builder_model: String,
     pub reviewer_model: String,
     pub coder_model: String,
-    /// Optional LLM router (e.g. Mercury Decide). Empty = fast heuristic.
+    /// Optional model for the Explore subagent. Empty = the selected model.
     pub router_model: String,
     pub use_planner: bool,
     pub use_reviewer: bool,
@@ -101,7 +101,7 @@ impl Default for Settings {
             planner_model: String::new(),
             builder_model: String::new(),
             reviewer_model: String::new(),
-            coder_model: "cohere/north-mini-code:free".into(),
+            coder_model: String::new(),
             router_model: String::new(),
             use_planner: true,
             use_reviewer: false,
@@ -144,8 +144,29 @@ impl Settings {
     pub fn load() -> Self {
         std::fs::read_to_string(Self::path())
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
+            .and_then(|s| serde_json::from_str::<Self>(&s).ok())
+            .map(Self::drop_retired_models)
             .unwrap_or_default()
+    }
+    /// Points settings that still name a retired (broken) free model back at Auto / the default.
+    fn drop_retired_models(mut self) -> Self {
+        let retired = |m: &String| crate::ai::models::RETIRED_MODELS.contains(&m.as_str());
+        if retired(&self.selected_model) {
+            self.selected_model = crate::ai::models::AUTO_ID.into();
+        }
+        for m in [
+            &mut self.planner_model,
+            &mut self.builder_model,
+            &mut self.reviewer_model,
+            &mut self.coder_model,
+            &mut self.router_model,
+        ] {
+            if retired(m) {
+                m.clear();
+            }
+        }
+        self.custom_models.retain(|m| !retired(m));
+        self
     }
     pub fn save(&self) {
         let _ = std::fs::create_dir_all(&self.models_dir);

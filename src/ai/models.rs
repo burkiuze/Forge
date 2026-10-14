@@ -11,32 +11,44 @@ pub struct ModelInfo {
     pub blurb: &'static str,
 }
 
+/// What "Auto" really sends: free models that follow tool instructions, tried in order
+/// (OpenRouter falls through on rate limits). `openrouter/free` alone can land on safety
+/// classifiers or tiny models that can't build anything.
+pub const AUTO_MODELS: &[&str] = &[
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "google/gemma-4-31b-it:free",
+];
+
+/// Free models that fail inside Forge (not chat models, agent-harness only, or empty replies).
+/// Saved settings that point at them fall back to Auto.
+pub const RETIRED_MODELS: &[&str] = &[
+    "inception/mercury-decide:free",
+    "thinkingmachines/inkling-small:free",
+    "cohere/north-mini-code:free",
+];
+
 /// Built-in cloud models (all free tier on OpenRouter).
 pub const CLOUD_MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: AUTO_ID,
         name: "Auto",
-        blurb: "Best available free model, picked automatically",
+        blurb: "Best free models, switches automatically when one is busy",
+    },
+    ModelInfo {
+        id: "nvidia/nemotron-3-super-120b-a12b:free",
+        name: "Nemotron 3 Super",
+        blurb: "NVIDIA · 120B MoE · 262K ctx · strong agent",
+    },
+    ModelInfo {
+        id: "nvidia/nemotron-3-ultra-550b-a55b:free",
+        name: "Nemotron 3 Ultra",
+        blurb: "NVIDIA · 550B MoE · 1M ctx",
     },
     ModelInfo {
         id: "google/gemma-4-31b-it:free",
         name: "Gemma 4 31B",
         blurb: "Google DeepMind · 262K ctx · multimodal, tool use",
-    },
-    ModelInfo {
-        id: "inception/mercury-decide:free",
-        name: "Mercury Decide",
-        blurb: "Inception · structured decisions (great as router)",
-    },
-    ModelInfo {
-        id: "cohere/north-mini-code:free",
-        name: "North Mini Code",
-        blurb: "Cohere · agentic coding MoE · 256K ctx",
-    },
-    ModelInfo {
-        id: "thinkingmachines/inkling-small:free",
-        name: "Inkling Small",
-        blurb: "Thinking Machines · MoE · 1.05M ctx",
     },
 ];
 
