@@ -118,6 +118,22 @@ fn list_conversations() -> Vec<(String, String, u64)> {
     out
 }
 
+/// A change waiting for the user's decision.
+enum Pending {
+    /// Scene/file tool executed on the UI thread after approval.
+    Tool(ToolCall, std::sync::mpsc::Sender<Result<String, String>>),
+    /// Worker-side action (asset download) that only needs a yes/no.
+    Approve(ToolCall, std::sync::mpsc::Sender<bool>),
+}
+
+impl Pending {
+    fn call(&self) -> &ToolCall {
+        match self {
+            Pending::Tool(c, _) | Pending::Approve(c, _) => c,
+        }
+    }
+}
+
 pub struct ChatPanel {
     pub conv: Conversation,
     pub input: String,
@@ -130,7 +146,10 @@ pub struct ChatPanel {
     pub attach_selection: bool,
     focus_input: bool,
     /// A destructive tool call waiting for the user's permission.
-    pending: Option<(ToolCall, std::sync::mpsc::Sender<Result<String, String>>)>,
+    pending: Option<Pending>,
+    /// "Accept all" was pressed for the current turn.
+    accept_all_turn: bool,
+    pub permission: crate::config::Permission,
     /// Index of the first entry of the current/last turn.
     turn_start: usize,
     show_review: bool,
@@ -151,6 +170,8 @@ impl Default for ChatPanel {
             attach_selection: true,
             focus_input: false,
             pending: None,
+            accept_all_turn: false,
+            permission: Default::default(),
             turn_start: 0,
             show_review: false,
             backlog: Default::default(),
@@ -167,6 +188,7 @@ pub enum ChatRequest {
     Approve(bool, bool),
     UndoTurn,
     Feedback(bool),
+    PermissionChanged,
 }
 
 const WORKFLOWS: &[(&str, &str, &str)] = &[
@@ -239,6 +261,7 @@ impl ChatPanel {
             self.conv.title = prompt.chars().take(60).collect();
         }
         self.turn_start = self.conv.entries.len();
+        self.accept_all_turn = false;
         self.show_review = false;
         self.conv
             .entries
@@ -251,31 +274,34 @@ impl ChatPanel {
         self.backlog.extend(rest);
     }
 
-    pub fn pending_name(&self) -> Option<String> {
-        self.pending.as_ref().map(|(c, _)| c.name.clone())
-    }
-
     /// Resolve the parked permission request.
     pub fn resolve(
         &mut self,
         allow: bool,
         mut exec: impl FnMut(&ToolCall) -> Result<String, String>,
     ) {
-        let Some((call, reply)) = self.pending.take() else {
+        let Some(p) = self.pending.take() else {
             return;
         };
-        let r = if allow {
-            exec(&call)
-        } else {
-            Err(t(
-                "The user denied this action.",
-                "Kullanıcı bu işlemi reddetti.",
-            )
-            .to_string())
-        };
-        let _ = reply.send(r.clone());
-        if let Some(e) = self.agent_entry() {
-            e.tools.push((call, r));
+        match p {
+            Pending::Tool(call, reply) => {
+                let r = if allow {
+                    exec(&call)
+                } else {
+                    Err(t(
+                        "The user rejected this action.",
+                        "Kullanıcı bu işlemi reddetti.",
+                    )
+                    .to_string())
+                };
+                let _ = reply.send(r.clone());
+                if let Some(e) = self.agent_entry() {
+                    e.tools.push((call, r));
+                }
+            }
+            Pending::Approve(_, reply) => {
+                let _ = reply.send(allow);
+            }
         }
     }
 
@@ -381,9 +407,21 @@ impl ChatPanel {
                         }
                     }
                 }
-                AgentEvent::Tool { call, reply } if needs_approval(&call) => {
+                AgentEvent::Approve { call, reply } => {
+                    if self.accept_all_turn || !needs_approval(&call) {
+                        let _ = reply.send(true);
+                    } else {
+                        self.pending = Some(Pending::Approve(call, reply));
+                        let rest: Vec<AgentEvent> = events.collect();
+                        self.requeue(rest);
+                        return;
+                    }
+                }
+                AgentEvent::Tool { call, reply }
+                    if !self.accept_all_turn && needs_approval(&call) =>
+                {
                     // Park it; remaining events are re-queued behind the approval.
-                    self.pending = Some((call, reply));
+                    self.pending = Some(Pending::Tool(call, reply));
                     let rest: Vec<AgentEvent> = events.collect();
                     self.requeue(rest);
                     return;
@@ -612,9 +650,20 @@ impl ChatPanel {
     }
 
     fn approval_card(&mut self, ui: &mut egui::Ui, reqs: &mut Vec<ChatRequest>) {
-        let Some((call, _)) = &self.pending else {
+        let Some(p) = &self.pending else {
             return;
         };
+        let call = p.call().clone();
+        let (icon, verb) = tool_verb(&call.name);
+        let target = call
+            .args
+            .get("target")
+            .or_else(|| call.args.get("name"))
+            .or_else(|| call.args.get("id"))
+            .or_else(|| call.args.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         egui::Frame::new()
             .fill(theme::BG2)
             .stroke(egui::Stroke::new(1.0_f32, theme::GOLD))
@@ -622,27 +671,40 @@ impl ChatPanel {
             .inner_margin(8)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.label(
-                    RichText::new(t("Permission needed", "İzin gerekiyor"))
-                        .strong()
-                        .color(theme::GOLD),
-                );
-                ui.label(format!(
-                    "{} {}",
-                    t("The agent wants to run", "Ajan şunu çalıştırmak istiyor:"),
-                    call.name
-                ));
-                ui.label(
-                    RichText::new(call.args.to_string().chars().take(200).collect::<String>())
-                        .monospace()
-                        .size(10.5)
-                        .weak(),
-                );
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(t("Review change", "Değişikliği onayla"))
+                            .strong()
+                            .color(theme::GOLD),
+                    );
+                    ui.label(
+                        RichText::new(t("Manual mode", "Manuel mod"))
+                            .size(10.5)
+                            .weak(),
+                    );
+                });
+                ui.label(format!("{icon} {verb}: {}  {target}", call.name));
+                egui::CollapsingHeader::new(RichText::new(t("Details", "Ayrıntılar")).size(11.0))
+                    .id_salt("approval_details")
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(140.0)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(
+                                        serde_json::to_string_pretty(&call.args)
+                                            .unwrap_or_default(),
+                                    )
+                                    .monospace()
+                                    .size(10.5),
+                                );
+                            });
+                    });
                 ui.horizontal(|ui| {
                     if ui
                         .add(
                             egui::Button::new(
-                                RichText::new(t("Allow", "İzin ver")).color(Color32::WHITE),
+                                RichText::new(t("✔ Accept", "✔ Kabul et")).color(Color32::WHITE),
                             )
                             .fill(theme::ACCENT),
                         )
@@ -650,15 +712,26 @@ impl ChatPanel {
                     {
                         reqs.push(ChatRequest::Approve(true, false));
                     }
-                    if ui.button(t("Always allow", "Her zaman izin ver")).clicked() {
+                    if ui
+                        .button(t("Accept all", "Tümünü kabul et"))
+                        .on_hover_text(t(
+                            "Accept every change for the rest of this request",
+                            "Bu isteğin geri kalanındaki tüm değişiklikleri kabul et",
+                        ))
+                        .clicked()
+                    {
                         reqs.push(ChatRequest::Approve(true, true));
                     }
-                    if ui.button(t("Deny", "Reddet")).clicked() {
+                    if ui.button(t("✖ Reject", "✖ Reddet")).clicked() {
                         reqs.push(ChatRequest::Approve(false, false));
                     }
                 });
             });
         ui.add_space(4.0);
+    }
+
+    pub fn accept_all(&mut self) {
+        self.accept_all_turn = true;
     }
 
     /// "N changes · Review · Undo" bar for the latest turn.
@@ -881,6 +954,35 @@ impl ChatPanel {
                             }
                         },
                     );
+                    let (pi, pl) = match self.permission {
+                        crate::config::Permission::Manual => ("✋", t("Manual", "Manuel")),
+                        crate::config::Permission::Auto => ("⚡", "Auto"),
+                    };
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new(if ui.available_width() > 120.0 {
+                                    format!("{pi} {pl}")
+                                } else {
+                                    pi.to_string()
+                                })
+                                .size(12.0)
+                                .weak(),
+                            )
+                            .frame(false),
+                        )
+                        .on_hover_text(t(
+                            "Manual: you accept or reject every change. Auto: changes are accepted automatically. Click to switch.",
+                            "Manuel: her değişikliği sen onaylarsın. Auto: değişiklikler otomatik kabul edilir. Değiştirmek için tıkla.",
+                        ))
+                        .clicked()
+                    {
+                        self.permission = match self.permission {
+                            crate::config::Permission::Manual => crate::config::Permission::Auto,
+                            crate::config::Permission::Auto => crate::config::Permission::Manual,
+                        };
+                        reqs.push(ChatRequest::PermissionChanged);
+                    }
                     let globe = RichText::new("🌐").color(if self.web {
                         theme::ACCENT
                     } else {
@@ -1027,6 +1129,9 @@ fn tool_verb(name: &str) -> (&'static str, &'static str) {
         "todo_write" => ("☰", t("Planned", "Planlandı")),
         "remember" => ("💭", t("Remembered", "Hatırlandı")),
         "asset_search" => ("📦", t("Browsed assets", "Varlık arandı")),
+        "list_assets" | "inspect_asset" => ("📄", t("Inspected assets", "Varlıklar incelendi")),
+        "generate_sound" => ("🔊", t("Generated sound", "Ses üretildi")),
+        "create_animation" => ("🎞", t("Created animation", "Animasyon oluşturuldu")),
         "asset_import" => ("⬇", t("Imported", "İçe aktarıldı")),
         _ => ("✏", t("Edited", "Düzenlendi")),
     }

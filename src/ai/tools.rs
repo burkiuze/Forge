@@ -1,6 +1,8 @@
 //! Scene tools exposed to agents, a model-agnostic text tool-call protocol, and the executor.
 
-use crate::scene::{parse_color, EntityId, Light, MeshKind, Pattern, Rigidbody, Scene};
+use crate::scene::{
+    parse_color, Animator, AudioSource, EntityId, Light, MeshKind, Pattern, Rigidbody, Scene,
+};
 use glam::Vec3;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -22,6 +24,9 @@ Available tools:
 - set_script {target, code} -> attach a Rhai script.
 - ask_coder {target, goal} -> delegate script writing to the Coder agent (it writes & attaches the script).
 - add_camera {name, position, rotation, fov, follow:"entity name"} (follow keeps the offset to the target during play).
+- generate_sound {preset:"coin|jump|laser|explosion|hit|powerup|click|blip", name} -> creates Audio/<name>.wav (CC0, generated locally).
+- create_animation {name, preset?:"bob|spin|pulse|walk|swing|swing_alt|door|shake|flash|hover", length, loop, tracks:[{property:"position|rotation|scale|color", keys:[{t, v:[x,y,z]}]}], target?} -> Animations/<name>.anim.json (position/rotation are offsets, scale is a multiplier).
+- Components on create/update_entity: audio:{clip:"Audio/x.wav", volume, loop, play_on_start} · animator:{clip:"preset:spin" or "Animations/x.anim.json", speed, play_on_start} (false removes).
 - set_environment {sky_top:"#hex", sky_bottom:"#hex", ambient:0..1, gravity:-18}
 - clear_scene {keep:["names to keep"]}
 - select {target}
@@ -33,6 +38,8 @@ Available tools:
 - task {agent:"explore"|"coder", prompt} -> run a subagent (explore = read-only research; coder = writes scripts) and get its report.
 - list_files {path:"Scripts"} · read_file {path} · write_file {path, content} · grep {pattern} -> project files (paths relative to the project folder).
 - set_script also accepts {target, file:"Scripts/player.rhai"} to attach a script file.
+- list_assets {} -> every asset already in the project (models, textures, audio, animations, scripts, prefabs).
+- inspect_asset {path} -> details of one asset: model size (extents) and triangle count, texture resolution, audio length, animation tracks.
 - asset_search {source:"polyhaven|ambientcg", kind:"textures|models", query} -> free CC0 assets (Poly Haven has textures + 3D models, ambientCG has PBR materials).
 - asset_import {source, kind, id} -> downloads into the project; returns {path, extents}. Then use the texture with update_entity {material:{texture: path}} (set color "#ffffff"), or place a model with create_entity {mesh:"model", model: path, scale: extents}.
 
@@ -50,6 +57,7 @@ Built-in functions:
   destroy_touching(this.name, "Coin") -> destroys those, returns count
   destroy("Name")   spawn("Name", "cube", x, y, z, "#ff0000")   set_color("Name", "#00ff00")
   pos_of("Name") -> [x,y,z]   distance("A", "B")   exists("Name")   random(lo, hi)
+  play_sound("Audio/coin.wav") / play_sound(path, volume)   play_animation("Name", "preset:spin")   stop_animation("Name")
   get_global("score") / set_global("score", v)   hud("text shown on screen")   log("debug")
 Rules: use floats (1.0 not 1) for math with positions; `let` for locals; no semicolon after fn blocks needed.
 Example player:
@@ -287,6 +295,63 @@ fn apply_fields(scene: &mut Scene, id: EntityId, a: &Value) -> Result<(), String
     if let Some(b) = a.get("static").and_then(|b| b.as_bool()) {
         e.is_static = b;
     }
+    match a.get("audio") {
+        Some(Value::Bool(false)) | Some(Value::Null) => e.audio = None,
+        Some(Value::String(c)) => {
+            e.audio = Some(AudioSource {
+                clip: c.clone(),
+                ..Default::default()
+            })
+        }
+        Some(Value::Object(o)) => {
+            let mut au = e.audio.clone().unwrap_or_default();
+            if let Some(c) = o.get("clip").and_then(|v| v.as_str()) {
+                au.clip = c.to_string();
+            }
+            if let Some(v) = o.get("volume").and_then(|v| v.as_f64()) {
+                au.volume = v as f32;
+            }
+            if let Some(v) = o
+                .get("loop")
+                .or_else(|| o.get("looping"))
+                .and_then(|v| v.as_bool())
+            {
+                au.looping = v;
+            }
+            if let Some(v) = o.get("play_on_start").and_then(|v| v.as_bool()) {
+                au.play_on_start = v;
+            }
+            e.audio = Some(au);
+        }
+        _ => {}
+    }
+    match a.get("animator").or_else(|| a.get("animation")) {
+        Some(Value::Bool(false)) | Some(Value::Null) => e.animator = None,
+        Some(Value::String(c)) => {
+            e.animator = Some(Animator {
+                clip: normalize_clip(c),
+                ..Default::default()
+            })
+        }
+        Some(Value::Object(o)) => {
+            let mut an = e.animator.clone().unwrap_or_default();
+            if let Some(c) = o
+                .get("clip")
+                .or_else(|| o.get("preset"))
+                .and_then(|v| v.as_str())
+            {
+                an.clip = normalize_clip(c);
+            }
+            if let Some(v) = o.get("speed").and_then(|v| v.as_f64()) {
+                an.speed = v as f32;
+            }
+            if let Some(v) = o.get("play_on_start").and_then(|v| v.as_bool()) {
+                an.play_on_start = v;
+            }
+            e.animator = Some(an);
+        }
+        _ => {}
+    }
     let m = a.get("material").cloned().unwrap_or(Value::Null);
     let mat = |k: &str| m.get(k).or_else(|| a.get(k));
     let mt = &mut e.material;
@@ -326,6 +391,15 @@ fn apply_fields(scene: &mut Scene, id: EntityId, a: &Value) -> Result<(), String
     Ok(())
 }
 
+/// "spin" → "preset:spin"; paths are kept as-is.
+fn normalize_clip(c: &str) -> String {
+    if c.contains('/') || c.contains('.') || c.starts_with("preset:") {
+        c.to_string()
+    } else {
+        format!("preset:{}", c.to_lowercase())
+    }
+}
+
 fn create(scene: &mut Scene, a: &Value) -> Result<EntityId, String> {
     let name = a.get("name").and_then(|n| n.as_str()).unwrap_or("Entity");
     let mesh = MeshKind::parse(a.get("mesh").and_then(|m| m.as_str()).unwrap_or("cube"));
@@ -341,9 +415,6 @@ pub struct ToolOutcome {
     pub result: String,
     pub select: Option<EntityId>,
 }
-
-/// Tools that change or delete things and therefore ask the user first (opencode "ask" permission).
-pub const DESTRUCTIVE: &[&str] = &["delete_entity", "clear_scene", "write_file", "delete_file"];
 
 /// Tools that modify the scene or project (counted as "changes" in the agent panel).
 pub fn is_mutation(name: &str) -> bool {
@@ -361,6 +432,8 @@ pub fn is_mutation(name: &str) -> bool {
             | "task"
             | "todo_write"
             | "asset_search"
+            | "list_assets"
+            | "inspect_asset"
     )
 }
 
@@ -469,6 +542,100 @@ pub fn execute_in(
                 hits.join("\n")
             })
         }
+        "list_assets" => {
+            let r = need_root()?;
+            let mut out = vec![];
+            for folder in crate::assets::FOLDERS {
+                let mut files = vec![];
+                walk(&r.join(folder), r, 2, &mut files);
+                let files: Vec<String> = files.into_iter().filter(|f| !f.ends_with('/')).collect();
+                out.push(format!(
+                    "{folder}/ ({}): {}",
+                    files.len(),
+                    if files.is_empty() {
+                        "-".into()
+                    } else {
+                        files.join(", ")
+                    }
+                ));
+            }
+            ok(out.join("\n"))
+        }
+        "inspect_asset" => {
+            let p = project_path(need_root()?, arg("path"))?;
+            ok(inspect_asset(&p)?)
+        }
+        "generate_sound" => {
+            let r = need_root()?;
+            let preset = crate::audio::Preset::parse(arg("preset")).ok_or(
+                "preset must be one of coin, jump, laser, explosion, hit, powerup, click, blip",
+            )?;
+            let name = if arg("name").is_empty() {
+                preset.name()
+            } else {
+                arg("name")
+            };
+            let seed = a
+                .get("seed")
+                .and_then(|v| v.as_u64())
+                .unwrap_or_else(|| name.bytes().map(|b| b as u64).sum::<u64>() + 7);
+            let rel = crate::audio::generate(r, preset, name, seed)?;
+            ok(format!("sound saved: {rel} (use it with audio:{{clip}} or play_sound(\"{rel}\") in scripts)"))
+        }
+        "create_animation" => {
+            let r = need_root()?;
+            let mut clip = match a.get("preset").and_then(|p| p.as_str()) {
+                Some(p) => crate::animation::preset(p).ok_or_else(|| {
+                    format!(
+                        "unknown preset '{p}' (use {})",
+                        crate::animation::PRESETS.join(", ")
+                    )
+                })?,
+                None => crate::animation::Clip::default(),
+            };
+            if let Some(n) = a.get("name").and_then(|n| n.as_str()) {
+                clip.name = n.to_string();
+            }
+            if let Some(l) = a.get("length").and_then(|v| v.as_f64()) {
+                clip.length = l as f32;
+            }
+            if let Some(l) = a.get("loop").and_then(|v| v.as_bool()) {
+                clip.looping = l;
+            }
+            if let Some(tracks) = a.get("tracks").and_then(|t| t.as_array()) {
+                for tr in tracks {
+                    let prop: crate::animation::Property =
+                        serde_json::from_value(tr["property"].clone())
+                            .map_err(|e| format!("track property: {e}"))?;
+                    for k in tr["keys"].as_array().cloned().unwrap_or_default() {
+                        let t = k["t"].as_f64().unwrap_or(0.0) as f32;
+                        let v = k
+                            .get("v")
+                            .or_else(|| k.get("value"))
+                            .and_then(vec3)
+                            .ok_or("each key needs t and v:[x,y,z]")?;
+                        clip.set_key(prop, t, v.to_array());
+                    }
+                }
+            }
+            let safe: String = clip
+                .name
+                .chars()
+                .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                .collect();
+            let rel = format!("Animations/{safe}.anim.json");
+            clip.save(&r.join(&rel))?;
+            let mut msg = format!("animation saved: {rel}");
+            if !arg("target").is_empty() {
+                let id = target(scene, a)?;
+                scene.get_mut(id).unwrap().animator = Some(Animator {
+                    clip: rel.clone(),
+                    ..Default::default()
+                });
+                msg.push_str(&format!(" and assigned to '{}'", arg("target")));
+            }
+            ok(msg)
+        }
         "set_script" if a.get("file").is_some() && a.get("code").is_none() => {
             let p = project_path(need_root()?, arg("file"))?;
             let code = std::fs::read_to_string(&p).map_err(|e| e.to_string())?;
@@ -476,8 +643,83 @@ pub fn execute_in(
             c.args = json!({"target": a.get("target").cloned().unwrap_or_default(), "code": code});
             execute(scene, &c)
         }
+        "create_entity" | "create_many" | "update_entity" if root.is_some() => {
+            // Models placed without a scale get their real-world size.
+            let mut c = call.clone();
+            let fix = |v: &mut Value| {
+                if v.get("model").and_then(|m| m.as_str()).is_some() && v.get("scale").is_none() {
+                    let rel = v["model"].as_str().unwrap().to_string();
+                    if let Ok(p) = project_path(root.unwrap(), &rel) {
+                        if let Ok(m) = crate::model::load(&p) {
+                            v["scale"] = json!(m.extents.to_array());
+                            if v.get("mesh").is_none() {
+                                v["mesh"] = json!("model");
+                            }
+                        }
+                    }
+                }
+            };
+            if c.name == "create_many" {
+                if let Some(list) = c.args.get_mut("entities").and_then(|e| e.as_array_mut()) {
+                    list.iter_mut().for_each(fix);
+                }
+            } else {
+                fix(&mut c.args);
+            }
+            execute(scene, &c)
+        }
         _ => execute(scene, call),
     }
+}
+
+/// Human/agent-readable description of an asset file.
+pub fn inspect_asset(p: &Path) -> Result<String, String> {
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let size = std::fs::metadata(p)
+        .map_err(|e| format!("{}: {e}", p.display()))?
+        .len();
+    if name.ends_with(".gltf") || name.ends_with(".glb") {
+        let m = crate::model::load(p)?;
+        let e = m.extents;
+        return Ok(format!(
+            "3D model · size {:.2} x {:.2} x {:.2} m (use as scale) · {} triangles · texture: {} · {} KB",
+            e.x,
+            e.y,
+            e.z,
+            m.verts.len() / crate::mesh::STRIDE / 3,
+            if m.texture.is_some() { "yes" } else { "no" },
+            size / 1024
+        ));
+    }
+    if name.ends_with(".png") || name.ends_with(".jpg") || name.ends_with(".jpeg") {
+        let (w, h) = image::image_dimensions(p).map_err(|e| e.to_string())?;
+        return Ok(format!("texture · {w}x{h} px · {} KB", size / 1024));
+    }
+    if crate::audio::is_audio(p) {
+        let secs = crate::audio::duration(p)
+            .map(|d| format!("{d:.2} s"))
+            .unwrap_or_else(|| "unknown length".into());
+        return Ok(format!("audio clip · {secs} · {} KB", size / 1024));
+    }
+    if name.ends_with(".anim.json") {
+        let c = crate::animation::Clip::load(p)?;
+        let tracks: Vec<String> = c
+            .tracks
+            .iter()
+            .map(|t| format!("{} ({} keys)", t.property.label(), t.keys.len()))
+            .collect();
+        return Ok(format!(
+            "animation '{}' · {:.2} s · loop={} · tracks: {}",
+            c.name,
+            c.length,
+            c.looping,
+            tracks.join(", ")
+        ));
+    }
+    Ok(format!("file · {} KB", size / 1024))
 }
 
 fn walk(dir: &Path, root: &Path, depth: u32, out: &mut Vec<String>) {

@@ -194,6 +194,46 @@ impl Default for Material {
 
 pub const LAYERS: [&str; 6] = ["Default", "Environment", "Player", "Enemy", "Pickup", "UI"];
 
+/// Plays an audio clip (project-relative path).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioSource {
+    pub clip: String,
+    pub volume: f32,
+    pub looping: bool,
+    pub play_on_start: bool,
+}
+
+impl Default for AudioSource {
+    fn default() -> Self {
+        Self {
+            clip: String::new(),
+            volume: 1.0,
+            looping: false,
+            play_on_start: true,
+        }
+    }
+}
+
+/// Plays an animation clip: `Animations/x.anim.json` or a built-in `preset:<name>`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Animator {
+    pub clip: String,
+    pub speed: f32,
+    pub play_on_start: bool,
+}
+
+impl Default for Animator {
+    fn default() -> Self {
+        Self {
+            clip: "preset:bob".into(),
+            speed: 1.0,
+            play_on_start: true,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CameraComp {
@@ -227,10 +267,14 @@ pub struct Entity {
     pub layer: String,
     pub is_static: bool,
     pub collider: bool,
+    /// Explicit collider box (local size) — used by composite characters with no mesh.
+    pub collider_size: Option<Vec3>,
     pub trigger: bool,
     pub rigidbody: Option<Rigidbody>,
     pub light: Option<Light>,
     pub camera: Option<CameraComp>,
+    pub audio: Option<AudioSource>,
+    pub animator: Option<Animator>,
     /// Rhai script source. Defines `fn start()` and/or `fn update(dt)`.
     pub script: String,
 }
@@ -251,12 +295,22 @@ impl Default for Entity {
             layer: "Default".into(),
             is_static: false,
             collider: true,
+            collider_size: None,
             trigger: false,
             rigidbody: None,
             light: None,
             camera: None,
+            audio: None,
+            animator: None,
             script: String::new(),
         }
+    }
+}
+
+impl Entity {
+    /// Does this entity take part in collisions/overlaps?
+    pub fn has_collider(&self) -> bool {
+        self.mesh != MeshKind::None || self.collider_size.is_some()
     }
 }
 
@@ -610,6 +664,8 @@ impl Scene {
                 if e.layer != "Default" { o.insert("layer".into(), e.layer.clone().into()); }
                 if !e.model.is_empty() { o.insert("model".into(), e.model.clone().into()); }
                 if let Some(c) = &e.camera { o.insert("camera".into(), serde_json::json!({"fov": c.fov, "follow": c.follow})); }
+                if let Some(a) = &e.audio { o.insert("audio".into(), serde_json::json!({"clip": a.clip, "loop": a.looping})); }
+                if let Some(a) = &e.animator { o.insert("animator".into(), serde_json::json!({"clip": a.clip})); }
                 if !e.script.is_empty() { o.insert("script_lines".into(), e.script.lines().count().into()); }
                 v
             })

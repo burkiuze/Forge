@@ -86,7 +86,7 @@ fn tools_edit_scene() {
 #[test]
 fn platformer_plays() {
     let scene = Template::Platformer.build();
-    let (mut rt, errors) = Runtime::new(scene);
+    let (mut rt, errors) = Runtime::new(scene, None);
     assert!(errors.is_empty(), "{errors:?}");
     // Fall onto the ground and settle.
     for _ in 0..120 {
@@ -221,6 +221,7 @@ fn agents_build_scene_end_to_end() {
         session_id: "test".into(),
         summary: String::new(),
         project_root: std::env::temp_dir(),
+        permission: crate::config::Permission::Auto,
     };
     let h = agent::spawn(job, egui::Context::default());
     let mut roles = vec![];
@@ -463,4 +464,87 @@ fn local_hosts_bypass_proxy() {
     assert!(bypass_proxy("http://localhost:11434/v1"));
     assert!(bypass_proxy("http://[::1]:8420"));
     assert!(!bypass_proxy("https://openrouter.ai/api/v1"));
+}
+
+#[test]
+fn audio_and_animation_assets_via_tools() {
+    use crate::ai::tools::execute_in;
+    let dir = std::env::temp_dir().join(format!("forge-av-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut s = Scene::starter();
+    let call = |name: &str, args| ToolCall {
+        name: name.into(),
+        args,
+    };
+    let r = execute_in(
+        &mut s,
+        &call(
+            "generate_sound",
+            json!({"preset": "coin", "name": "pickup"}),
+        ),
+        Some(&dir),
+    )
+    .unwrap()
+    .result;
+    assert!(r.contains("Audio/pickup.wav"), "{r}");
+    let wav = std::fs::read(dir.join("Audio/pickup.wav")).unwrap();
+    assert_eq!(&wav[0..4], b"RIFF");
+    assert_eq!(&wav[8..12], b"WAVE");
+    assert!(crate::audio::duration(&dir.join("Audio/pickup.wav")).unwrap() > 0.05);
+
+    execute_in(
+        &mut s,
+        &call(
+            "create_animation",
+            json!({"preset": "bob", "name": "float"}),
+        ),
+        Some(&dir),
+    )
+    .unwrap();
+    let ls = execute_in(&mut s, &call("list_assets", json!({})), Some(&dir))
+        .unwrap()
+        .result;
+    assert!(
+        ls.contains("pickup.wav") && ls.contains(".anim.json"),
+        "{ls}"
+    );
+    let info = crate::ai::tools::inspect_asset(&dir.join("Audio/pickup.wav")).unwrap();
+    assert!(!info.is_empty());
+    assert!(crate::ai::tools::is_mutation("generate_sound"));
+    assert!(!crate::ai::tools::is_mutation("list_assets"));
+    assert!(!crate::ai::tools::is_mutation("inspect_asset"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn runtime_plays_sounds_and_animations() {
+    let mut scene = Scene::starter();
+    let id = scene.find("Cube").unwrap();
+    let start_y = scene.get(id).unwrap().transform.position.y;
+    {
+        let e = scene.get_mut(id).unwrap();
+        e.animator = Some(crate::scene::Animator {
+            clip: "preset:bob".into(),
+            speed: 1.0,
+            play_on_start: true,
+        });
+        e.script = "fn start() { play_sound(\"Audio/x.wav\", 0.5); }".into();
+    }
+    let (mut rt, _) = crate::runtime::Runtime::new(scene, None);
+    let mut moved = false;
+    for _ in 0..30 {
+        rt.step(1.0 / 30.0);
+        let y = rt.scene.get(id).unwrap().transform.position.y;
+        if (y - start_y).abs() > 1e-3 {
+            moved = true;
+        }
+    }
+    assert!(moved, "animator did not move the entity");
+    let sounds = rt.take_sounds();
+    assert!(
+        sounds
+            .iter()
+            .any(|(p, v, _)| p.ends_with("Audio/x.wav") && (*v - 0.5).abs() < 1e-3),
+        "{sounds:?}"
+    );
 }

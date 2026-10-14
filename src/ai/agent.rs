@@ -46,6 +46,11 @@ impl Role {
 }
 
 pub enum AgentEvent {
+    /// Ask the user before a worker-side change (e.g. downloading an asset).
+    Approve {
+        call: ToolCall,
+        reply: Sender<bool>,
+    },
     Start {
         role: Role,
         model: String,
@@ -126,6 +131,7 @@ pub struct Job {
     pub summary: String,
     /// Project folder (asset imports land here).
     pub project_root: std::path::PathBuf,
+    pub permission: crate::config::Permission,
 }
 
 pub struct AgentHandle {
@@ -200,7 +206,25 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "grep",
     "task",
     "todo_write",
+    "asset_search",
+    "list_assets",
+    "inspect_asset",
 ];
+
+/// How the Builder should work — assets first, then logic, then polish.
+const BUILDER_GUIDE: &str = "## How to work
+You can build complete games from an empty scene, extend them, or fix one specific part the user points at.
+1. Understand: call get_scene and list_assets first. For a fix, change only what the user asked about (inspect with get_scene / grep / read_file) and keep everything else intact.
+2. Plan with todo_write for anything bigger than a single change, and keep it updated.
+3. ASSETS FIRST — never model characters, props or vehicles out of primitive shapes:
+   - Reuse what is in the project (list_assets, inspect_asset to learn a model's size).
+   - Otherwise find real assets: asset_search {source:\"polyhaven\", kind:\"models\"} for 3D models, kind:\"textures\" or source:\"ambientcg\" for surfaces, then asset_import and place models with create_entity {mesh:\"model\", model: path} (real size is applied automatically).
+   - If no suitable model exists (e.g. a specific character), use the closest real asset, a simple stand-in object clearly named \"<Thing> (placeholder)\", and tell the user they can import their own model (Content Browser › Import from device, glTF/GLB) — never build a figure out of spheres and cylinders.
+   - Primitives are only for level geometry: ground, walls, platforms, ramps, triggers, pickups.
+4. Gameplay: give the player a rigidbody + controller script (set_script or ask_coder), add goals (collectibles, enemies, timers), a HUD via hud(), win/lose conditions, and a Main Camera that follows the player.
+5. Feel: generate_sound for coins/jumps/hits and trigger them with play_sound in scripts; animator presets (bob, spin, pulse, hover, door…) or create_animation for life; materials, textures and lights for looks.
+6. Batch with create_many, give every entity a clear unique name, keep things on the ground (y = height/2).
+7. Finish with a short summary of what you built and how to play (keys), plus anything the user should import or decide.";
 
 const EXPLORE_PROMPT: &str = "You are the EXPLORE subagent of the Forge engine: a search specialist. Your role is EXCLUSIVELY to search and analyze \
 (scene, project files, the web, memory). You MUST NOT modify anything. Return a concise report with the facts, names and links the caller needs.";
@@ -287,6 +311,19 @@ impl Orchestrator {
         }
     }
 
+    /// Manual permission mode: block until the user accepts or rejects.
+    fn approve(&self, call: &ToolCall) -> bool {
+        if self.job.permission == crate::config::Permission::Auto {
+            return true;
+        }
+        let (tx, rx) = channel();
+        self.send(AgentEvent::Approve {
+            call: call.clone(),
+            reply: tx,
+        });
+        rx.recv().unwrap_or(false)
+    }
+
     /// Run a scene tool on the UI thread and wait for its result.
     fn ui_tool(&self, call: ToolCall) -> Result<String, String> {
         let (rtx, rrx) = channel();
@@ -371,6 +408,7 @@ impl Orchestrator {
                     .collect::<Vec<_>>()
                     .join("\n")
             }),
+            "asset_import" if !self.approve(call) => Err("The user rejected this action.".into()),
             "asset_import" => crate::store::import(
                 crate::store::Source::parse(&arg("source")),
                 crate::store::Kind::parse(&arg("kind")),
@@ -591,9 +629,7 @@ impl Orchestrator {
     fn build(&mut self, plan: Option<&str>, feedback: Option<&str>) -> Result<String, String> {
         let mut msgs = vec![Msg::system(format!(
             "{PERSONA}\nYou are the BUILDER agent. You edit the open scene ONLY through tools.\n{TOOL_DOCS}\n{SCRIPT_DOCS}\n\
-             Work efficiently: batch with create_many, give every entity a clear unique name, keep things on the ground, \
-             use materials and lights to make scenes look good, add a Main Camera that frames the action (follow the player for games). \
-             For gameplay logic write scripts with set_script or delegate with ask_coder. Use web_search when you need outside knowledge.\n{}",
+             {BUILDER_GUIDE}\n{}",
             self.context_block()
         ))];
         msgs.extend(self.job.history.iter().cloned());

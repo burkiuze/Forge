@@ -292,6 +292,9 @@ impl Editor {
             .map(|x| x.name.clone())
             .collect();
         let textures = self.project_textures();
+        let audio_clips = list_rel(&self.project_root(), "Audio", &crate::audio::AUDIO_EXTS);
+        let anim_clips = self.animation_clips();
+        let mut preview_sound: Option<String> = None;
 
         ui.horizontal(|ui| {
             changed |= ui.checkbox(&mut e.active, "").changed();
@@ -538,6 +541,94 @@ impl Editor {
                 changed = true;
             }
         }
+        if let Some(a) = &mut e.audio {
+            let mut keep = true;
+            section_removable(ui, "Audio Source", &mut keep, |ui| {
+                egui::Grid::new("audio").num_columns(2).show(ui, |ui| {
+                    ui.label(t("Clip", "Klip"));
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("aclip")
+                            .selected_text(if a.clip.is_empty() {
+                                t("None", "Yok").to_string()
+                            } else {
+                                a.clip.clone()
+                            })
+                            .width(150.0)
+                            .show_ui(ui, |ui| {
+                                for c in &audio_clips {
+                                    changed |=
+                                        ui.selectable_value(&mut a.clip, c.clone(), c).changed();
+                                }
+                            });
+                        if ui
+                            .small_button("▶")
+                            .on_hover_text(t("Preview", "Dinle"))
+                            .clicked()
+                            && !a.clip.is_empty()
+                        {
+                            preview_sound = Some(a.clip.clone());
+                        }
+                    });
+                    ui.end_row();
+                    ui.label(t("Volume", "Ses seviyesi"));
+                    changed |= ui
+                        .add(egui::Slider::new(&mut a.volume, 0.0..=2.0))
+                        .changed();
+                    ui.end_row();
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut a.looping, "Loop").changed();
+                    changed |= ui.checkbox(&mut a.play_on_start, "Play On Start").changed();
+                });
+                if audio_clips.is_empty() {
+                    ui.label(
+                        RichText::new(t(
+                            "No clips yet — Asset Store › Audio or import from device.",
+                            "Henüz klip yok — Varlık Mağazası › Ses ya da cihazdan içe aktar.",
+                        ))
+                        .size(10.5)
+                        .weak(),
+                    );
+                }
+            });
+            if !keep {
+                e.audio = None;
+                changed = true;
+            }
+        }
+        if let Some(a) = &mut e.animator {
+            let mut keep = true;
+            section_removable(ui, "Animator", &mut keep, |ui| {
+                egui::Grid::new("animator").num_columns(2).show(ui, |ui| {
+                    ui.label(t("Clip", "Klip"));
+                    egui::ComboBox::from_id_salt("anclip")
+                        .selected_text(a.clip.clone())
+                        .width(170.0)
+                        .show_ui(ui, |ui| {
+                            for c in &anim_clips {
+                                changed |= ui.selectable_value(&mut a.clip, c.clone(), c).changed();
+                            }
+                        });
+                    ui.end_row();
+                    ui.label(t("Speed", "Hız"));
+                    changed |= ui.add(egui::Slider::new(&mut a.speed, 0.1..=4.0)).changed();
+                    ui.end_row();
+                });
+                ui.horizontal(|ui| {
+                    changed |= ui.checkbox(&mut a.play_on_start, "Play On Start").changed();
+                    if ui
+                        .small_button(t("🎞 Edit clip", "🎞 Klibi düzenle"))
+                        .clicked()
+                    {
+                        self.open_tab = Some(Tab::Animation);
+                    }
+                });
+            });
+            if !keep {
+                e.animator = None;
+                changed = true;
+            }
+        }
         if !e.script.is_empty() {
             let mut keep = true;
             section_removable(ui, t("Script (Rhai)", "Betik (Rhai)"), &mut keep, |ui| {
@@ -611,6 +702,21 @@ impl Editor {
                         changed = true;
                         ui.close_menu();
                     }
+                    ui.label(RichText::new(t("Audio", "Ses")).small().weak());
+                    if add(ui, "Audio Source", e.audio.is_none()) {
+                        e.audio = Some(crate::scene::AudioSource {
+                            clip: audio_clips.first().cloned().unwrap_or_default(),
+                            ..Default::default()
+                        });
+                        changed = true;
+                        ui.close_menu();
+                    }
+                    ui.label(RichText::new(t("Animation", "Animasyon")).small().weak());
+                    if add(ui, "Animator", e.animator.is_none()) {
+                        e.animator = Some(crate::scene::Animator::default());
+                        changed = true;
+                        ui.close_menu();
+                    }
                     ui.label(RichText::new(t("Scripts", "Betikler")).small().weak());
                     for (name, code) in SCRIPT_TEMPLATES {
                         if add(ui, name, true) {
@@ -641,6 +747,12 @@ impl Editor {
             }
         });
 
+        if let Some(c) = preview_sound {
+            let p = self.project_root().join(c);
+            if let Err(err) = self.audio.play(&p, 1.0, None) {
+                self.log(LogLevel::Warn, err);
+            }
+        }
         if remove {
             self.delete_selected();
             return;

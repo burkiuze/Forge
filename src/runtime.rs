@@ -36,6 +36,17 @@ enum Cmd {
         color: Option<[f32; 3]>,
     },
     SetColor(String, [f32; 3]),
+    PlaySound(String, f32),
+    PlayAnim(String, String),
+    StopAnim(String),
+}
+
+/// A running animation on one entity (applied as deltas so scripts/physics can still move it).
+struct AnimState {
+    clip: crate::animation::Clip,
+    time: f32,
+    speed: f32,
+    prev: crate::animation::Pose,
 }
 
 #[derive(Default)]
@@ -90,6 +101,10 @@ pub struct Runtime {
     cam_offsets: HashMap<EntityId, Vec3>,
     pub time: f32,
     pub paused: bool,
+    root: Option<std::path::PathBuf>,
+    anims: HashMap<EntityId, AnimState>,
+    /// Sounds to play this frame: (absolute path, volume, loop owner).
+    sounds: Vec<(std::path::PathBuf, f32, Option<EntityId>)>,
 }
 
 fn normalize_key(k: &str) -> String {
@@ -113,7 +128,7 @@ fn dyn_f32(d: Option<&Dynamic>) -> Option<f32> {
 }
 
 impl Runtime {
-    pub fn new(scene: Scene) -> (Self, Vec<String>) {
+    pub fn new(scene: Scene, root: Option<std::path::PathBuf>) -> (Self, Vec<String>) {
         let shared = Rc::new(RefCell::new(Shared {
             rng: 0x9E3779B97F4A7C15,
             ..Default::default()
@@ -206,6 +221,28 @@ impl Runtime {
         let sh = shared.clone();
         engine.register_fn("hud", move |t: &str| sh.borrow_mut().hud = t.to_string());
         let sh = shared.clone();
+        engine.register_fn("play_sound", move |p: &str| {
+            sh.borrow_mut()
+                .commands
+                .push(Cmd::PlaySound(p.to_string(), 1.0))
+        });
+        let sh = shared.clone();
+        engine.register_fn("play_sound", move |p: &str, v: f32| {
+            sh.borrow_mut()
+                .commands
+                .push(Cmd::PlaySound(p.to_string(), v))
+        });
+        let sh = shared.clone();
+        engine.register_fn("play_animation", move |n: &str, c: &str| {
+            sh.borrow_mut()
+                .commands
+                .push(Cmd::PlayAnim(n.to_string(), c.to_string()))
+        });
+        let sh = shared.clone();
+        engine.register_fn("stop_animation", move |n: &str| {
+            sh.borrow_mut().commands.push(Cmd::StopAnim(n.to_string()))
+        });
+        let sh = shared.clone();
         engine.register_fn("random", move |lo: f32, hi: f32| -> f32 {
             let mut s = sh.borrow_mut();
             s.rng ^= s.rng << 13;
@@ -234,10 +271,102 @@ impl Runtime {
             cam_offsets: HashMap::new(),
             time: 0.0,
             paused: false,
+            root,
+            anims: HashMap::new(),
+            sounds: vec![],
         };
-        let errors = rt.compile_all();
+        let mut errors = rt.compile_all();
         rt.init_cameras();
+        errors.extend(rt.init_components());
         (rt, errors)
+    }
+
+    fn resolve(&self, rel: &str) -> std::path::PathBuf {
+        match &self.root {
+            Some(r) => r.join(rel),
+            None => std::path::PathBuf::from(rel),
+        }
+    }
+
+    fn load_clip(&self, clip: &str) -> Result<crate::animation::Clip, String> {
+        match clip.strip_prefix("preset:") {
+            Some(p) => {
+                crate::animation::preset(p).ok_or_else(|| format!("unknown animation preset '{p}'"))
+            }
+            None => crate::animation::Clip::load(&self.resolve(clip)),
+        }
+    }
+
+    fn start_anim(&mut self, id: EntityId, clip: &str, speed: f32) -> Result<(), String> {
+        let c = self.load_clip(clip)?;
+        let prev = c.sample(0.0);
+        self.anims.insert(
+            id,
+            AnimState {
+                clip: c,
+                time: 0.0,
+                speed,
+                prev,
+            },
+        );
+        Ok(())
+    }
+
+    /// Audio sources and animators that start with play.
+    fn init_components(&mut self) -> Vec<String> {
+        let mut errors = vec![];
+        let items: Vec<(
+            EntityId,
+            Option<crate::scene::AudioSource>,
+            Option<crate::scene::Animator>,
+        )> = self
+            .scene
+            .entities
+            .iter()
+            .map(|e| (e.id, e.audio.clone(), e.animator.clone()))
+            .collect();
+        for (id, audio, anim) in items {
+            if let Some(a) = audio.filter(|a| a.play_on_start && !a.clip.is_empty()) {
+                self.sounds
+                    .push((self.resolve(&a.clip), a.volume, a.looping.then_some(id)));
+            }
+            if let Some(a) = anim.filter(|a| a.play_on_start && !a.clip.is_empty()) {
+                if let Err(e) = self.start_anim(id, &a.clip, a.speed) {
+                    errors.push(e);
+                }
+            }
+        }
+        errors
+    }
+
+    /// Sounds requested since the last call (played by the editor's audio engine).
+    pub fn take_sounds(&mut self) -> Vec<(std::path::PathBuf, f32, Option<EntityId>)> {
+        std::mem::take(&mut self.sounds)
+    }
+
+    fn animate(&mut self, dt: f32) {
+        let mut done = vec![];
+        for (id, st) in self.anims.iter_mut() {
+            st.time += dt * st.speed;
+            let pose = st.clip.sample(st.time);
+            if let Some(e) = self.scene.get_mut(*id) {
+                let t = &mut e.transform;
+                t.position += pose.position - st.prev.position;
+                t.rotation += pose.rotation - st.prev.rotation;
+                let ps = st.prev.scale.max(Vec3::splat(1e-4));
+                t.scale = t.scale / ps * pose.scale;
+                if let Some(c) = pose.color {
+                    e.color = c;
+                }
+            }
+            st.prev = pose;
+            if st.clip.finished(st.time) {
+                done.push(*id);
+            }
+        }
+        for id in done {
+            self.anims.remove(&id);
+        }
     }
 
     fn compile_all(&mut self) -> Vec<String> {
@@ -315,6 +444,9 @@ impl Runtime {
             if e.mesh == MeshKind::Plane {
                 p.y = 0.0;
             }
+            if let Some(sz) = e.collider_size {
+                p *= sz;
+            }
             let w = m.transform_point3(p);
             lo = lo.min(w);
             hi = hi.max(w);
@@ -331,7 +463,7 @@ impl Runtime {
             if !self.scene.is_active(e.id) {
                 continue;
             }
-            let (lo, hi) = if e.mesh != MeshKind::None {
+            let (lo, hi) = if e.has_collider() {
                 self.world_aabb(e.id)
             } else {
                 (e.transform.position, e.transform.position)
@@ -353,7 +485,7 @@ impl Runtime {
             .iter()
             .filter(|(_, b)| {
                 let e = self.scene.get(b.id).unwrap();
-                e.mesh != MeshKind::None && (e.collider || e.trigger)
+                e.has_collider() && (e.collider || e.trigger)
             })
             .collect();
         let eps = 0.02;
@@ -440,6 +572,7 @@ impl Runtime {
             self.read_this(id);
         }
         self.apply_commands();
+        self.animate(dt);
         self.follow_cameras(dt);
         errors
     }
@@ -548,6 +681,22 @@ impl Runtime {
                         self.scene.get_mut(id).unwrap().color = c;
                     }
                 }
+                Cmd::PlaySound(p, v) => {
+                    let path = self.resolve(&p);
+                    self.sounds.push((path, v, None));
+                }
+                Cmd::PlayAnim(n, clip) => {
+                    if let Some(id) = self.scene.find(&n) {
+                        if let Err(e) = self.start_anim(id, &clip, 1.0) {
+                            self.shared.borrow_mut().logs.push(e);
+                        }
+                    }
+                }
+                Cmd::StopAnim(n) => {
+                    if let Some(id) = self.scene.find(&n) {
+                        self.anims.remove(&id);
+                    }
+                }
             }
         }
     }
@@ -580,7 +729,7 @@ impl Runtime {
             .filter(|e| {
                 e.collider
                     && !e.trigger
-                    && e.mesh != MeshKind::None
+                    && e.has_collider()
                     && self.scene.is_active(e.id)
                     && e.rigidbody.as_ref().map_or(true, |r| r.is_static)
             })

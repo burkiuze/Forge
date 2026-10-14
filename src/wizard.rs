@@ -176,6 +176,7 @@ impl Wizard {
                     });
                 });
             });
+        theme::made_by(ctx);
         result
     }
 

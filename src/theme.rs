@@ -93,3 +93,19 @@ pub fn draw_logo(painter: &egui::Painter, rect: egui::Rect) {
         ));
     }
 }
+
+/// Small, faint "made by burkiuze" credit at the bottom of the entry screens.
+pub fn made_by(ctx: &egui::Context) {
+    let screen = ctx.screen_rect();
+    let painter = ctx.layer_painter(egui::LayerId::new(
+        egui::Order::Foreground,
+        egui::Id::new("forge_made_by"),
+    ));
+    painter.text(
+        egui::pos2(screen.center().x, screen.bottom() - 10.0),
+        egui::Align2::CENTER_BOTTOM,
+        "made by burkiuze",
+        egui::FontId::proportional(10.5),
+        egui::Color32::from_rgba_unmultiplied(200, 195, 185, 70),
+    );
+}

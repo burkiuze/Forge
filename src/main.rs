@@ -2,8 +2,10 @@
 //! Forge — AI-native game engine & editor.
 
 mod ai;
+mod animation;
 mod app;
 mod assets;
+mod audio;
 mod catalog;
 mod chat;
 mod config;

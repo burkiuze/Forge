@@ -327,7 +327,20 @@ fn write(root: &Path, rel: &str, bytes: &[u8]) -> Result<(), String> {
 pub enum StoreAction {
     ApplyTexture(String),
     AddModel(Imported, String),
+    /// Play a sound file (absolute path) for preview.
+    Preview(std::path::PathBuf),
+    /// Attach an audio clip (project-relative) to the selected object.
+    AttachAudio(String),
+    /// Attach an animation clip (`preset:x` or project path) to the selected object.
+    AttachAnimation(String),
     Log(String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Section {
+    Online,
+    Sounds,
+    Animations,
 }
 
 type Slot<T> = Arc<Mutex<Option<Result<T, String>>>>;
@@ -346,6 +359,8 @@ pub struct Store {
     thumb_rx: Receiver<(String, Option<egui::ColorImage>)>,
     jobs: Arc<Mutex<HashMap<String, Result<Option<Imported>, String>>>>,
     show_links: bool,
+    section: Section,
+    sound_seed: u64,
 }
 
 impl Default for Store {
@@ -365,6 +380,8 @@ impl Default for Store {
             thumb_rx,
             jobs: Arc::new(Mutex::new(HashMap::new())),
             show_links: false,
+            section: Section::Online,
+            sound_seed: 1,
         }
     }
 }
@@ -480,6 +497,170 @@ impl Store {
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui, root: &Path, has_selection: bool) -> Vec<StoreAction> {
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.section,
+                Section::Online,
+                t("🌐 Online (CC0)", "🌐 Çevrimiçi (CC0)"),
+            );
+            ui.selectable_value(
+                &mut self.section,
+                Section::Sounds,
+                t("🔊 Sound Effects", "🔊 Ses Efektleri"),
+            );
+            ui.selectable_value(
+                &mut self.section,
+                Section::Animations,
+                t("🎞 Animations", "🎞 Animasyonlar"),
+            );
+        });
+        ui.separator();
+        match self.section {
+            Section::Online => self.online_ui(ui, root, has_selection),
+            Section::Sounds => self.sounds_ui(ui, root, has_selection),
+            Section::Animations => self.animations_ui(ui, root, has_selection),
+        }
+    }
+
+    fn sounds_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        root: &Path,
+        has_selection: bool,
+    ) -> Vec<StoreAction> {
+        let mut actions = vec![];
+        ui.label(RichText::new(t(
+            "Retro sound effects generated on your PC — free to use anywhere (CC0). 🎲 makes a new variation.",
+            "Bilgisayarında üretilen retro ses efektleri — her yerde serbestçe kullanılabilir (CC0). 🎲 yeni bir varyasyon üretir.",
+        )).small().weak());
+        ui.horizontal(|ui| {
+            ui.label(t("Variation", "Varyasyon"));
+            ui.add(egui::DragValue::new(&mut self.sound_seed).range(1..=9999));
+            if ui.button("🎲").clicked() {
+                self.sound_seed = (self.sound_seed * 7919 + 13) % 9973 + 1;
+            }
+        });
+        ui.add_space(4.0);
+        let preview_dir = crate::config::data_dir().join("preview");
+        egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+            for p in crate::audio::Preset::ALL {
+                egui::Frame::new().fill(theme::BG2).corner_radius(6).inner_margin(6).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("🔊 {}", p.name())).strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let name = format!("{}_{}", p.name(), self.sound_seed);
+                            if ui.add_enabled(has_selection, egui::Button::new(t("Add to selected", "Seçiliye ekle"))).clicked() {
+                                match crate::audio::generate(root, p, &name, self.sound_seed) {
+                                    Ok(rel) => actions.push(StoreAction::AttachAudio(rel)),
+                                    Err(e) => actions.push(StoreAction::Log(e)),
+                                }
+                            }
+                            if ui.button(t("💾 Save to Audio/", "💾 Audio/ içine kaydet")).clicked() {
+                                match crate::audio::generate(root, p, &name, self.sound_seed) {
+                                    Ok(rel) => actions.push(StoreAction::Log(format!("{} {rel}", t("Saved", "Kaydedildi:")))),
+                                    Err(e) => actions.push(StoreAction::Log(e)),
+                                }
+                            }
+                            if ui.button(t("▶ Preview", "▶ Dinle")).clicked() {
+                                if crate::audio::generate(&preview_dir, p, "preview", self.sound_seed).is_ok() {
+                                    actions.push(StoreAction::Preview(preview_dir.join("Audio/preview.wav")));
+                                }
+                            }
+                        });
+                    });
+                });
+            }
+            ui.add_space(8.0);
+            ui.label(RichText::new(t("Music & more sounds: Freesound, Kenney and OpenGameArt (see 🌐 Online › More free libraries), then Import from device.", "Müzik ve daha fazla ses: Freesound, Kenney ve OpenGameArt (🌐 Çevrimiçi › Diğer ücretsiz kütüphaneler), ardından Cihazdan içe aktar.")).size(10.5).weak());
+        });
+        actions
+    }
+
+    fn animations_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        root: &Path,
+        has_selection: bool,
+    ) -> Vec<StoreAction> {
+        let mut actions = vec![];
+        ui.label(RichText::new(t(
+            "Ready-made keyframe clips. Assign one directly, or save it to Animations/ and edit it in the Animation tab.",
+            "Hazır anahtar kareli klipler. Doğrudan ata ya da Animations/ içine kaydedip Animasyon sekmesinde düzenle.",
+        )).small().weak());
+        egui::ScrollArea::vertical()
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                for name in crate::animation::PRESETS {
+                    let clip = crate::animation::preset(name).unwrap();
+                    egui::Frame::new()
+                        .fill(theme::BG2)
+                        .corner_radius(6)
+                        .inner_margin(6)
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new(format!("🎞 {}", clip.name)).strong());
+                                let tracks: Vec<&str> =
+                                    clip.tracks.iter().map(|t| t.property.label()).collect();
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{:.1} s · {} · {}",
+                                        clip.length,
+                                        if clip.looping { "loop" } else { "once" },
+                                        tracks.join(", ")
+                                    ))
+                                    .size(10.5)
+                                    .weak(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .add_enabled(
+                                                has_selection,
+                                                egui::Button::new(t(
+                                                    "Assign to selected",
+                                                    "Seçiliye ata",
+                                                )),
+                                            )
+                                            .clicked()
+                                        {
+                                            actions.push(StoreAction::AttachAnimation(format!(
+                                                "preset:{name}"
+                                            )));
+                                        }
+                                        if ui
+                                            .button(t(
+                                                "💾 Save to Animations/",
+                                                "💾 Animations/ içine kaydet",
+                                            ))
+                                            .clicked()
+                                        {
+                                            let rel = format!("Animations/{name}.anim.json");
+                                            match clip.save(&root.join(&rel)) {
+                                                Ok(()) => actions.push(StoreAction::Log(format!(
+                                                    "{} {rel}",
+                                                    t("Saved", "Kaydedildi:")
+                                                ))),
+                                                Err(e) => actions.push(StoreAction::Log(e)),
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                }
+            });
+        actions
+    }
+
+    fn online_ui(
+        &mut self,
+        ui: &mut egui::Ui,
+        root: &Path,
+        has_selection: bool,
+    ) -> Vec<StoreAction> {
         let mut actions = vec![];
         let ctx = ui.ctx().clone();
         while let Ok((url, img)) = self.thumb_rx.try_recv() {

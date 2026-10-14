@@ -388,6 +388,7 @@ impl StartScreen {
                     });
             }
         }
+        theme::made_by(ctx);
         action
     }
 }

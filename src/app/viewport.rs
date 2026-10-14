@@ -89,7 +89,9 @@ impl Editor {
                 );
                 if mv != Vec3::ZERO {
                     let boost = if shift { 3.0 } else { 1.0 };
-                    self.cam.fly(mv * input.stable_dt.min(0.05) * 10.0 * boost);
+                    self.cam.fly(
+                        mv * input.stable_dt.min(0.05) * 10.0 * boost * self.settings.camera_speed,
+                    );
                     ui.ctx().request_repaint();
                 }
             }
@@ -107,7 +109,7 @@ impl Editor {
         if !game_view && !playing {
             if let Some(sel) = self.selected.filter(|s| self.scene.get(*s).is_some()) {
                 let p = self.scene.world_matrix(sel).w_axis.truncate();
-                let len = (cam.eye.distance(p) * 0.14).max(0.2);
+                let len = (cam.eye.distance(p) * 0.14 * self.settings.gizmo_size).max(0.2);
                 if let Some(sp) = cam.project(p, rect) {
                     center_screen = Some(sp);
                     for (i, axis) in [Vec3::X, Vec3::Y, Vec3::Z].iter().enumerate() {
@@ -299,7 +301,7 @@ impl Editor {
         // ---------------------------------------------------------- overlays
         let has_cam = render::main_camera(scene).is_some();
         let mut icons = vec![];
-        if !game_view {
+        if !game_view && self.settings.show_icons {
             for e in &scene.entities {
                 if e.mesh != MeshKind::None || !scene.is_active(e.id) {
                     continue;
@@ -626,6 +628,28 @@ impl Editor {
                 }
             }
             AssetKind::Scene => self.open_scene(path.to_path_buf()),
+            AssetKind::Audio | AssetKind::Animation => {
+                let target = ray
+                    .and_then(|(o, d)| render::pick(&self.scene, o, d))
+                    .or(self.selected);
+                let rel = path
+                    .strip_prefix(self.project_root())
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| path.display().to_string());
+                let audio = matches!(AssetKind::of(path), AssetKind::Audio);
+                if let Some(id) = target {
+                    self.push_undo();
+                    if let Some(e) = self.scene.get_mut(id) {
+                        if audio {
+                            e.audio.get_or_insert_with(Default::default).clip = rel;
+                        } else {
+                            e.animator.get_or_insert_with(Default::default).clip = rel;
+                        }
+                    }
+                    self.selected = Some(id);
+                    self.dirty = true;
+                }
+            }
             AssetKind::Model => {
                 let rel = path
                     .strip_prefix(self.project_root())

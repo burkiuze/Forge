@@ -25,6 +25,16 @@ pub fn default_projects_dir() -> PathBuf {
         .join("Forge Projects")
 }
 
+/// How agent actions are approved.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+pub enum Permission {
+    /// Every change (scene edits, file writes, asset downloads) asks Accept / Reject.
+    #[default]
+    Manual,
+    /// Everything is accepted automatically.
+    Auto,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -61,6 +71,19 @@ pub struct Settings {
     pub snap_scale: f32,
     pub show_stats: bool,
     pub show_grid: bool,
+    pub ai_enabled: bool,
+    pub permission: Permission,
+    pub autosave_minutes: u32,
+    pub show_start_screen: bool,
+    pub camera_speed: f32,
+    pub gizmo_size: f32,
+    pub show_icons: bool,
+    pub master_volume: f32,
+    pub mute_editor_audio: bool,
+    pub auto_update_check: bool,
+    pub ui_scale: f32,
+    pub agent_context_turns: u32,
+    pub web_results: u32,
 }
 
 impl Default for Settings {
@@ -97,6 +120,19 @@ impl Default for Settings {
             snap_scale: 0.1,
             show_stats: false,
             show_grid: true,
+            ai_enabled: true,
+            permission: Permission::Manual,
+            autosave_minutes: 5,
+            show_start_screen: true,
+            camera_speed: 1.0,
+            gizmo_size: 1.0,
+            show_icons: true,
+            master_volume: 1.0,
+            mute_editor_audio: false,
+            auto_update_check: true,
+            ui_scale: 1.0,
+            agent_context_turns: 6,
+            web_results: 6,
         }
     }
 }

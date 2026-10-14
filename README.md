@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/logo.png" width="110" alt="Forge"></p>
+<p align="center"><img src="docs/forge-banner.png" alt="Forge — Shaped by Fire"></p>
 
 # Forge
 
@@ -12,8 +12,12 @@
 | ![Start](docs/screenshots/start-screen.png) | ![Wizard](docs/screenshots/setup-wizard.png) |
 | **Inspector + gizmo** | **Yerel model kataloğu** |
 | ![Inspector](docs/screenshots/inspector.png) | ![Models](docs/screenshots/model-catalog.png) |
-| **Varlık Mağazası (CC0)** | |
-| ![Asset Store](docs/screenshots/asset-store.png) | |
+| **Varlık Mağazası (CC0)** | **Ses efektleri** |
+| ![Asset Store](docs/screenshots/asset-store.png) | ![Sounds](docs/screenshots/store-sounds.png) |
+| **Manuel izin: Kabul / Reddet** | **Animasyon sekmesi** |
+| ![Approval](docs/screenshots/approval.png) | ![Animation](docs/screenshots/animation.png) |
+| **Tercihler** | |
+| ![Preferences](docs/screenshots/preferences.png) | |
 
 ## Özellikler
 
@@ -24,10 +28,14 @@
 - Prefab'lar, prosedürel başlangıç dokuları, içe aktarma, oyunu tek başına derleme (Build Game)
 - Play / Pause / Step: Rhai betikleri, AABB fizik, takip kamerası, HUD
 - İngilizce / Türkçe arayüz
+- 🔊 **Ses**: Audio Source bileşeni (döngü, ses düzeyi, başlangıçta çal), `play_sound()` betik fonksiyonu, 8 hazır efekt üreteci (coin, jump, laser, explosion…) ile WAV oluşturma
+- 🎞 **Animasyon**: Animation sekmesi (anahtar kare kaydı, zaman çizelgesi, önizleme), Animator bileşeni, `.anim.json` klipleri ve hazır klipler (bob, spin, walk, door…)
+- ⬇ **Cihazdan içe aktarma**: dosya seçici veya pencereye sürükle-bırak (model, doku, ses, betik)
+- ⚙ **Tercihler**: Genel, Editör, Görüntü, Ses, AI, Ajanlar ve Modeller, Hafıza, Anahtarlar, Güncellemeler. AI tamamen kapatılabilir.
 
 **Ajan paneli (Antigravity tarzı, sağda)**
 - Modlar: **Planning** (Planner → Builder → Reviewer), **Fast** (doğrudan Builder), **Ask** (salt-okunur)
-- opencode'dan esinlenen mimari: birincil ajanlar + `task` alt-ajanları (**Explore** salt-okunur araştırma, **Coder** betik yazımı), araç izinleri (silme ve dosya yazma önce sorulur, "her zaman izin ver" seçeneği var), `todo_write` görev listesi, uzun sohbetlerde özetleme (compaction), sohbet geçmişi
+- opencode'dan esinlenen mimari: birincil ajanlar + `task` alt-ajanları (**Explore** salt-okunur araştırma, **Coder** betik yazımı), **izin modları: ✋ Manual** (her değişiklik, varlık indirme ve kurulum için Kabul / Reddet kartı) ve **⚡ Auto** (otomatik kabul), `todo_write` görev listesi, uzun sohbetlerde özetleme (compaction), sohbet geçmişi
 - 🌐 **Web araması cihazdan**: DuckDuckGo, gerekirse Bing; ayrıca `fetch_url` ile sayfa okuma. API anahtarı gerekmez.
 - 💭 **Ajan hafızası**: [TencentDB Agent Memory](https://github.com/TencentCloud/TencentDB-Agent-Memory). Memory Core (`:8420`) ile `/v3/conversation/add` (yazma) ve `/v3/atomic/search` (hatırlama) kullanılır. Bağlantı yoksa yerleşik çevrimdışı BM25 hafızası devreye girer.
 - "Düşündü: Xs" adımları, araç satırları, kaynak bağlantıları, İyi/Kötü geri bildirimi, "N değişiklik · İncele · Geri al" çubuğu
@@ -36,6 +44,7 @@
 **Varlık Mağazası: ücretsiz CC0 varlıklar**
 - **Poly Haven**: dokular ve glTF 3D modeller. **ambientCG**: 2000+ PBR malzeme. Arama, küçük resimler, tek tıkla projeye indirme, "Seçiliye uygula" ve "Sahneye koy".
 - glTF/GLB model desteği: gerçek boyutta, dokulu, gölgeli. İçerik Tarayıcı'dan çift tıkla veya sahneye sürükle.
+- **Önce varlık**: ajan karakter, araç ve eşyaları primitiflerden yapmaz. Projedeki varlıkları `list_assets` / `inspect_asset` ile inceler, yoksa `asset_search` / `asset_import` ile indirip kullanır.
 - Ajan da kullanabilir: `asset_search` / `asset_import` ("zemine ahşap doku bul ve uygula", "sahneye bir sandık koy").
 - Kenney, Quaternius, Poly Pizza, OpenGameArt, itch.io ve Freesound bağlantıları (bunların API'si yok; indirdiğin paketi İçe aktar ile eklersin).
 

@@ -51,8 +51,25 @@ impl Editor {
                     ui.close_menu();
                 }
             });
-            if ui.button(t("⬇ Import…", "⬇ İçe aktar…")).clicked() {
-                self.cb_import = Some(String::new());
+            if ui
+                .button(t("⬇ Import from device…", "⬇ Cihazdan içe aktar…"))
+                .on_hover_text(t(
+                    "Textures (png/jpg), models (glTF/GLB), audio (wav/ogg/mp3/flac), animations, scripts — or drag files onto the window.",
+                    "Doku (png/jpg), model (glTF/GLB), ses (wav/ogg/mp3/flac), animasyon, betik — ya da dosyaları pencereye sürükle.",
+                ))
+                .clicked()
+            {
+                let picked = rfd::FileDialog::new()
+                    .set_title(t("Import assets", "Varlık içe aktar"))
+                    .add_filter(t("All assets", "Tüm varlıklar"), &["png", "jpg", "jpeg", "gltf", "glb", "wav", "ogg", "mp3", "flac", "json", "rhai"])
+                    .add_filter(t("Textures", "Dokular"), &["png", "jpg", "jpeg"])
+                    .add_filter(t("3D models", "3D modeller"), &["gltf", "glb"])
+                    .add_filter(t("Audio", "Ses"), &["wav", "ogg", "mp3", "flac"])
+                    .pick_files();
+                match picked {
+                    Some(files) => self.import_files(&files),
+                    None => self.cb_import = Some(String::new()),
+                }
             }
             if ui
                 .button("⟳")
@@ -237,6 +254,8 @@ impl Editor {
                                         AssetKind::Scene => ACCENT,
                                         AssetKind::Prefab => Color32::from_rgb(130, 210, 160),
                                         AssetKind::Model => Color32::from_rgb(190, 160, 230),
+                                        AssetKind::Audio => Color32::from_rgb(240, 200, 90),
+                                        AssetKind::Animation => Color32::from_rgb(120, 220, 210),
                                         _ => theme::BONE,
                                     };
                                     ui.painter().text(
@@ -335,6 +354,47 @@ impl Editor {
                 }
                 (0, AssetKind::Scene) => self.open_scene(p),
                 (0, AssetKind::Prefab) => self.instantiate_prefab(&p),
+                (0, AssetKind::Audio) => {
+                    if let Err(e) = self.audio.play(&p, 1.0, None) {
+                        self.log(LogLevel::Warn, e);
+                    }
+                }
+                (1, AssetKind::Audio) => {
+                    let rel = p
+                        .strip_prefix(&root)
+                        .map(|x| x.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    if let Some(id) = self.selected {
+                        self.push_undo();
+                        if let Some(e) = self.scene.get_mut(id) {
+                            e.audio = Some(crate::scene::AudioSource {
+                                clip: rel,
+                                ..Default::default()
+                            });
+                        }
+                    }
+                }
+                (0, AssetKind::Animation) | (1, AssetKind::Animation) => {
+                    let rel = p
+                        .strip_prefix(&root)
+                        .map(|x| x.to_string_lossy().replace('\\', "/"))
+                        .unwrap_or_default();
+                    if a == 1 {
+                        if let Some(id) = self.selected {
+                            self.push_undo();
+                            if let Some(e) = self.scene.get_mut(id) {
+                                e.animator = Some(crate::scene::Animator {
+                                    clip: rel,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                    } else if let Ok(c) = crate::animation::Clip::load(&p) {
+                        self.anim.clip = c;
+                        self.anim.path = Some(rel);
+                        self.open_tab = Some(super::Tab::Animation);
+                    }
+                }
                 (0, AssetKind::Model) | (1, AssetKind::Model) => {
                     let rel = p
                         .strip_prefix(&root)
@@ -364,6 +424,26 @@ impl Editor {
                 _ => {}
             }
         }
+    }
+
+    /// Import files from the device into the project (dialog or OS drag & drop).
+    pub fn import_files(&mut self, files: &[PathBuf]) {
+        let root = self.project_root();
+        crate::assets::ensure_project(&root);
+        for r in crate::assets::import(&root, files) {
+            match r {
+                Ok(rel) => self.log(
+                    LogLevel::Info,
+                    format!("{} {rel}", t("Imported", "İçe aktarıldı:")),
+                ),
+                Err(e) => self.log(LogLevel::Error, e),
+            }
+        }
+        self.thumbs.clear();
+        if let Some(r) = &self.renderer {
+            r.lock().unwrap().invalidate_textures();
+        }
+        self.open_tab = Some(super::Tab::Content);
     }
 
     fn apply_asset(&mut self, p: &Path) {

@@ -1,7 +1,9 @@
 //! The Forge editor: dockable Unity/Unreal-style layout + Antigravity-style agent panel.
 
+mod animation_panel;
 mod content;
 mod panels;
+mod prefs;
 mod viewport;
 
 use crate::ai::agent::Job;
@@ -40,10 +42,11 @@ pub enum Tab {
     Console,
     Script,
     Store,
+    Animation,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 10] = [
+    pub const ALL: [Tab; 12] = [
         Tab::Scene,
         Tab::Game,
         Tab::Hierarchy,
@@ -52,6 +55,8 @@ impl Tab {
         Tab::Lighting,
         Tab::ProjectSettings,
         Tab::Content,
+        Tab::Store,
+        Tab::Animation,
         Tab::Console,
         Tab::Script,
     ];
@@ -68,6 +73,7 @@ impl Tab {
             Tab::Console => format!("🖥 {}", t("Console", "Konsol")),
             Tab::Script => format!("📜 {}", t("Script", "Betik")),
             Tab::Store => format!("📦 {}", t("Asset Store", "Varlık Mağazası")),
+            Tab::Animation => format!("🎞 {}", t("Animation", "Animasyon")),
         }
     }
 }
@@ -152,7 +158,10 @@ pub struct Editor {
     pub cb_new: Option<(u8, String)>,
     pub cb_import: Option<String>,
     pub thumbs: HashMap<PathBuf, egui::TextureHandle>,
-    pub always_allow: Vec<String>,
+    pub audio: crate::audio::AudioEngine,
+    pub last_autosave: Instant,
+    pub prefs_page: prefs::Page,
+    pub anim: animation_panel::AnimEditor,
     pub turn_undo: Option<String>,
     pub memory_status: Arc<Mutex<String>>,
 }
@@ -181,7 +190,13 @@ pub fn default_layout() -> DockState<Tab> {
     let [_center, _bottom] = surf.split_below(
         center,
         0.68,
-        vec![Tab::Content, Tab::Store, Tab::Console, Tab::Script],
+        vec![
+            Tab::Content,
+            Tab::Store,
+            Tab::Animation,
+            Tab::Console,
+            Tab::Script,
+        ],
     );
     dock
 }
@@ -207,14 +222,19 @@ impl ForgeApp {
         let mut chat = ChatPanel::default();
         chat.web = settings.agent_web;
         chat.mode = settings.agent_mode;
+        chat.permission = settings.permission;
 
         let player = player_scene.is_some();
         let screen = if player {
             Screen::Editor
         } else if !settings.setup_done {
             Screen::Wizard
-        } else {
+        } else if settings.show_start_screen
+            || settings.last_scene.as_ref().map_or(true, |p| !p.is_file())
+        {
             Screen::Start
+        } else {
+            Screen::Editor
         };
         let ed = Editor {
             settings,
@@ -253,7 +273,10 @@ impl ForgeApp {
             cb_new: None,
             cb_import: None,
             thumbs: HashMap::new(),
-            always_allow: vec![],
+            audio: Default::default(),
+            last_autosave: Instant::now(),
+            prefs_page: prefs::Page::General,
+            anim: Default::default(),
             turn_undo: None,
             memory_status: Arc::new(Mutex::new(String::new())),
         };
@@ -268,7 +291,9 @@ impl ForgeApp {
             last_title: String::new(),
             last_update_check: Instant::now(),
         };
-        if !player {
+        cc.egui_ctx
+            .set_zoom_factor(app.ed.settings.ui_scale.clamp(0.6, 2.0));
+        if !player && app.ed.settings.auto_update_check {
             app.updater.check(&cc.egui_ctx);
         }
         if let Some(p) = player_scene {
@@ -557,7 +582,7 @@ impl Editor {
         if self.runtime.is_some() {
             return;
         }
-        let (rt, errors) = Runtime::new(self.scene.clone());
+        let (rt, errors) = Runtime::new(self.scene.clone(), Some(self.project_root()));
         for e in errors {
             self.log(LogLevel::Error, e);
         }
@@ -570,6 +595,7 @@ impl Editor {
 
     pub fn stop(&mut self) {
         if self.runtime.take().is_some() {
+            self.audio.stop_all();
             self.focus_tab = Some(Tab::Scene);
             self.log(
                 LogLevel::Info,
@@ -597,6 +623,14 @@ impl Editor {
         rt.set_input(down, pressed);
         let errors = rt.step(dt);
         let logs = rt.take_logs();
+        let sounds = rt.take_sounds();
+        self.audio.master = self.settings.master_volume;
+        self.audio.muted = self.settings.mute_editor_audio && !self.player_mode;
+        for (path, vol, owner) in sounds {
+            if let Err(e) = self.audio.play(&path, vol, owner) {
+                self.log(LogLevel::Warn, e);
+            }
+        }
         for e in errors {
             self.log(LogLevel::Error, e);
         }
@@ -680,6 +714,7 @@ impl Editor {
             session_id: self.chat.conv.id.clone(),
             summary: self.chat.summary(),
             project_root: self.project_root(),
+            permission: self.settings.permission,
         };
         self.chat.start(job, ctx);
     }
@@ -713,15 +748,17 @@ impl Editor {
                 ChatRequest::Send => self.send_chat(ctx),
                 ChatRequest::SelectModel(m) => self.select_model(m, ctx),
                 ChatRequest::Settings => self.dialogs.settings = true,
-                ChatRequest::Approve(allow, always) => {
+                ChatRequest::Approve(allow, all) => {
                     let mut chat = std::mem::take(&mut self.chat);
-                    if always {
-                        if let Some(name) = chat.pending_name() {
-                            self.always_allow.push(name);
-                        }
+                    if all {
+                        chat.accept_all();
                     }
                     chat.resolve(allow, |c| self.exec_tool(c));
                     self.chat = chat;
+                }
+                ChatRequest::PermissionChanged => {
+                    self.settings.permission = self.chat.permission;
+                    self.settings.save();
                 }
                 ChatRequest::UndoTurn => {
                     if let Some(s) = self.turn_undo.take() {
@@ -857,6 +894,17 @@ impl Editor {
                     self.delete_selected();
                     ui.close_menu();
                 }
+                ui.separator();
+                if ui
+                    .add(
+                        egui::Button::new(t("⚙ Preferences…", "⚙ Tercihler…"))
+                            .shortcut_text("Ctrl+,"),
+                    )
+                    .clicked()
+                {
+                    self.dialogs.settings = true;
+                    ui.close_menu();
+                }
             });
             ui.menu_button(t("GameObject", "Nesne"), |ui| self.create_menu(ui));
             ui.menu_button(t("Window", "Pencere"), |ui| {
@@ -873,6 +921,17 @@ impl Editor {
                 }
             });
             ui.menu_button("AI", |ui| {
+                if ui
+                    .checkbox(
+                        &mut self.settings.ai_enabled,
+                        t("Enable Forge AI", "Forge AI'ı etkinleştir"),
+                    )
+                    .changed()
+                {
+                    self.settings.save();
+                    ui.close_menu();
+                }
+                ui.separator();
                 if ui.button(t("⚙ AI Settings…", "⚙ AI Ayarları…")).clicked() {
                     self.dialogs.settings = true;
                     ui.close_menu();
@@ -1122,14 +1181,10 @@ impl Editor {
         }
         if self.dialogs.settings {
             let mut open = true;
-            egui::Window::new(t("AI Settings", "AI Ayarları"))
+            egui::Window::new(t("Preferences", "Tercihler"))
                 .open(&mut open)
-                .default_width(540.0)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(560.0)
-                        .show(ui, |ui| self.ai_settings_ui(ui));
-                });
+                .default_size([760.0, 560.0])
+                .show(ctx, |ui| self.preferences_ui(ui));
             self.dialogs.settings = open;
         }
         if self.dialogs.scripting_help {
@@ -1159,136 +1214,6 @@ impl Editor {
                 });
             });
             self.dialogs.about = open;
-        }
-    }
-
-    pub fn ai_settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new(t("API keys", "API anahtarları")).strong());
-        egui::Grid::new("keys").num_columns(2).show(ui, |ui| {
-            ui.label("OpenRouter");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.secrets.openrouter_key)
-                    .password(true)
-                    .desired_width(340.0),
-            );
-            ui.end_row();
-            ui.label(t("Hugging Face (opt.)", "Hugging Face (ops.)"));
-            ui.add(
-                egui::TextEdit::singleline(&mut self.secrets.hf_token)
-                    .password(true)
-                    .desired_width(340.0),
-            );
-            ui.end_row();
-        });
-        ui.horizontal(|ui| {
-            if ui
-                .button(t("💾 Save keys", "💾 Anahtarları kaydet"))
-                .clicked()
-            {
-                let msg = match self.secrets.save() {
-                    Ok(()) => format!("Keys saved to {}", crate::config::env_file().display()),
-                    Err(e) => format!("Could not save keys: {e}"),
-                };
-                self.console.push((LogLevel::Info, msg));
-            }
-            ui.small(crate::config::env_file().display().to_string());
-        });
-        ui.separator();
-        ui.label(RichText::new(t("Agents", "Ajanlar")).strong());
-        let s = &mut self.settings;
-        let mut options: Vec<(String, String)> = vec![(
-            String::new(),
-            t("(same as chat model)", "(sohbet modeliyle aynı)").into(),
-        )];
-        options.extend(
-            crate::ai::models::CLOUD_MODELS
-                .iter()
-                .map(|m| (m.id.to_string(), m.name.to_string())),
-        );
-        options.extend(s.custom_models.iter().map(|m| (m.clone(), m.clone())));
-        options.extend(
-            self.library
-                .installed_models()
-                .into_iter()
-                .map(|m| (m.clone(), crate::ai::models::display_name(&m))),
-        );
-        options.extend(
-            self.library
-                .ollama_models()
-                .into_iter()
-                .map(|m| (m.clone(), crate::ai::models::display_name(&m))),
-        );
-        egui::Grid::new("agents")
-            .num_columns(2)
-            .spacing([10.0, 6.0])
-            .show(ui, |ui| {
-                for (label, value) in [
-                    ("🗺 Planner", &mut s.planner_model),
-                    ("🔨 Builder", &mut s.builder_model),
-                    ("⌨ Coder", &mut s.coder_model),
-                    ("🔭 Explore", &mut s.router_model),
-                    ("🔍 Reviewer", &mut s.reviewer_model),
-                ] {
-                    ui.label(label);
-                    let shown = options
-                        .iter()
-                        .find(|(id, _)| id == value)
-                        .map(|(_, n)| n.clone())
-                        .unwrap_or_else(|| value.clone());
-                    egui::ComboBox::from_id_salt(label)
-                        .selected_text(shown)
-                        .width(300.0)
-                        .show_ui(ui, |ui| {
-                            for (id, n) in &options {
-                                ui.selectable_value(value, id.clone(), n);
-                            }
-                        });
-                    ui.end_row();
-                }
-            });
-        ui.checkbox(
-            &mut s.use_planner,
-            t(
-                "Planner agent in Planning mode",
-                "Planlama modunda Planlayıcı ajan",
-            ),
-        );
-        ui.checkbox(
-            &mut s.use_reviewer,
-            t(
-                "Reviewer agent (checks result, one fix round)",
-                "Denetçi ajan (sonucu kontrol eder, bir düzeltme turu)",
-            ),
-        );
-        ui.horizontal(|ui| {
-            ui.label(t("Max builder steps", "Maks. kurucu adımı"));
-            ui.add(egui::DragValue::new(&mut s.max_agent_steps).range(1..=30));
-            ui.label(t("Temperature", "Sıcaklık"));
-            ui.add(egui::Slider::new(&mut s.temperature, 0.0..=1.5));
-        });
-        ui.label(
-            RichText::new(t(
-                "Permissions: deleting entities, clearing the scene and writing files ask first.",
-                "İzinler: nesne silme, sahneyi temizleme ve dosya yazma önce sorulur.",
-            ))
-            .small()
-            .weak(),
-        );
-        if !self.always_allow.is_empty()
-            && ui
-                .small_button(format!(
-                    "{} ({})",
-                    t("Reset 'always allow'", "'Her zaman izin ver'i sıfırla"),
-                    self.always_allow.join(", ")
-                ))
-                .clicked()
-        {
-            self.always_allow.clear();
-        }
-        ui.separator();
-        panels::memory_settings(ui, &mut self.settings, &self.memory_status);
-        if ui.button(t("Save settings", "Ayarları kaydet")).clicked() {
-            self.settings.save();
         }
     }
 }
@@ -1336,6 +1261,7 @@ impl TabViewer for Editor {
             Tab::Content => self.content_ui(ui),
             Tab::Console => self.console_ui(ui),
             Tab::Script => self.script_ui(ui),
+            Tab::Animation => self.animation_ui(ui),
             Tab::Store => {
                 let root = self.project_root();
                 crate::assets::ensure_project(&root);
@@ -1347,6 +1273,36 @@ impl TabViewer for Editor {
                             self.add_model(&imp.path, &name, imp.extents, imp.color)
                         }
                         crate::store::StoreAction::Log(m) => self.log(LogLevel::Info, m),
+                        crate::store::StoreAction::Preview(p) => {
+                            if let Err(e) = self.audio.play(&p, 1.0, None) {
+                                self.log(LogLevel::Warn, e);
+                            }
+                        }
+                        crate::store::StoreAction::AttachAudio(clip) => {
+                            if let Some(id) = self.selected {
+                                self.push_undo();
+                                if let Some(e) = self.scene.get_mut(id) {
+                                    e.audio = Some(crate::scene::AudioSource {
+                                        clip: clip.clone(),
+                                        play_on_start: false,
+                                        ..Default::default()
+                                    });
+                                }
+                                self.log(LogLevel::Info, format!("Audio Source: {clip}"));
+                            }
+                        }
+                        crate::store::StoreAction::AttachAnimation(clip) => {
+                            if let Some(id) = self.selected {
+                                self.push_undo();
+                                if let Some(e) = self.scene.get_mut(id) {
+                                    e.animator = Some(crate::scene::Animator {
+                                        clip: clip.clone(),
+                                        ..Default::default()
+                                    });
+                                }
+                                self.log(LogLevel::Info, format!("Animator: {clip}"));
+                            }
+                        }
                     }
                 }
             }
@@ -1472,7 +1428,7 @@ impl eframe::App for ForgeApp {
         }
 
         // While the editor is open, look for new GitHub releases every 30 minutes.
-        if self.last_update_check.elapsed().as_secs() > 30 * 60 {
+        if ed.settings.auto_update_check && self.last_update_check.elapsed().as_secs() > 30 * 60 {
             self.last_update_check = Instant::now();
             if matches!(
                 self.updater.state(),
@@ -1486,10 +1442,12 @@ impl eframe::App for ForgeApp {
 
         // Agent events → execute tools on the scene (destructive ones wait for approval).
         let mut chat = std::mem::take(&mut ed.chat);
-        let allow = ed.always_allow.clone();
+        let manual = ed.settings.permission == crate::config::Permission::Manual;
+        chat.permission = ed.settings.permission;
         chat.poll(
             |call| ed.exec_tool(call),
-            |call| tools::DESTRUCTIVE.contains(&call.name.as_str()) && !allow.contains(&call.name),
+            // Manual: every change asks. Auto: only nothing (everything is accepted).
+            |call| manual && (tools::is_mutation(&call.name) || call.name == "asset_import"),
         );
         ed.chat = chat;
 
@@ -1497,7 +1455,7 @@ impl eframe::App for ForgeApp {
 
         // Shortcuts.
         let typing = ctx.wants_keyboard_input();
-        let (save, undo, redo, dup, del, play, focus_ai, w, e, r) = ctx.input(|i| {
+        let (save, undo, redo, dup, del, play, focus_ai, prefs, w, e, r) = ctx.input(|i| {
             let c = i.modifiers.command;
             (
                 c && i.key_pressed(egui::Key::S),
@@ -1508,6 +1466,7 @@ impl eframe::App for ForgeApp {
                 i.key_pressed(egui::Key::Delete),
                 c && i.key_pressed(egui::Key::P),
                 c && i.key_pressed(egui::Key::L),
+                c && i.key_pressed(egui::Key::Comma),
                 !c && i.key_pressed(egui::Key::W) && !i.pointer.secondary_down(),
                 !c && i.key_pressed(egui::Key::E) && !i.pointer.secondary_down(),
                 !c && i.key_pressed(egui::Key::R) && !i.pointer.secondary_down(),
@@ -1525,6 +1484,9 @@ impl eframe::App for ForgeApp {
         }
         if focus_ai {
             ed.chat.focus();
+        }
+        if prefs {
+            ed.dialogs.settings = true;
         }
         if !typing && ed.runtime.is_none() {
             if undo {
@@ -1650,29 +1612,55 @@ impl eframe::App for ForgeApp {
             });
 
         // Right: agent panel (Antigravity-style, outside the dock).
-        egui::SidePanel::right("agent")
-            .default_width(370.0)
-            .width_range(300.0..=680.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(theme::BG1)
-                    .inner_margin(egui::Margin::symmetric(10, 8)),
-            )
-            .show(ctx, |ui| {
-                let mut local = ed.library.installed_models();
-                local.extend(ed.library.ollama_models());
-                let current = ed.settings.selected_model.clone();
-                let names: Vec<String> = ed.scene.entities.iter().map(|e| e.name.clone()).collect();
-                let project = ed
-                    .scene_path
-                    .as_ref()
-                    .and_then(|p| p.parent())
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| ed.scene.name.clone());
-                let reqs = ed.chat.ui(ui, &current, &local, &names, &project);
-                ed.handle_chat_requests(reqs, ctx);
-            });
+        if ed.settings.ai_enabled {
+            egui::SidePanel::right("agent")
+                .default_width(370.0)
+                .width_range(300.0..=680.0)
+                .frame(
+                    egui::Frame::new()
+                        .fill(theme::BG1)
+                        .inner_margin(egui::Margin::symmetric(10, 8)),
+                )
+                .show(ctx, |ui| {
+                    let mut local = ed.library.installed_models();
+                    local.extend(ed.library.ollama_models());
+                    let current = ed.settings.selected_model.clone();
+                    let names: Vec<String> =
+                        ed.scene.entities.iter().map(|e| e.name.clone()).collect();
+                    let project = ed
+                        .scene_path
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .and_then(|p| p.file_name())
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_else(|| ed.scene.name.clone());
+                    let reqs = ed.chat.ui(ui, &current, &local, &names, &project);
+                    ed.handle_chat_requests(reqs, ctx);
+                });
+        }
+
+        // Files dropped from the OS → import into the project.
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            ed.import_files(&dropped);
+        }
+
+        // Autosave.
+        if ed.settings.autosave_minutes > 0
+            && ed.dirty
+            && ed.runtime.is_none()
+            && ed.scene_path.is_some()
+            && ed.last_autosave.elapsed().as_secs() >= ed.settings.autosave_minutes as u64 * 60
+        {
+            ed.last_autosave = Instant::now();
+            ed.save();
+        }
 
         // Dock layout requests.
         if ed.reset_layout {

@@ -3,7 +3,14 @@
 use image::{Rgba, RgbaImage};
 use std::path::{Path, PathBuf};
 
-pub const FOLDERS: [&str; 4] = ["Scripts", "Textures", "Prefabs", "Models"];
+pub const FOLDERS: [&str; 6] = [
+    "Scripts",
+    "Textures",
+    "Prefabs",
+    "Models",
+    "Audio",
+    "Animations",
+];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AssetKind {
@@ -13,6 +20,8 @@ pub enum AssetKind {
     Texture,
     Prefab,
     Model,
+    Audio,
+    Animation,
     Other,
 }
 
@@ -25,7 +34,11 @@ impl AssetKind {
             .file_name()
             .map(|n| n.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        if n.ends_with(".prefab.json") {
+        if n.ends_with(".anim.json") {
+            AssetKind::Animation
+        } else if crate::audio::is_audio(p) {
+            AssetKind::Audio
+        } else if n.ends_with(".prefab.json") {
             AssetKind::Prefab
         } else if n.ends_with(".scene.json") || n.ends_with(".json") {
             AssetKind::Scene
@@ -47,9 +60,88 @@ impl AssetKind {
             AssetKind::Texture => "🖼",
             AssetKind::Prefab => "📦",
             AssetKind::Model => "🗿",
+            AssetKind::Audio => "🔊",
+            AssetKind::Animation => "🎞",
             AssetKind::Other => "📄",
         }
     }
+}
+
+/// Destination folder for an imported file, by kind.
+pub fn folder_for(kind: AssetKind) -> &'static str {
+    match kind {
+        AssetKind::Texture => "Textures",
+        AssetKind::Model => "Models",
+        AssetKind::Audio => "Audio",
+        AssetKind::Animation => "Animations",
+        AssetKind::Script => "Scripts",
+        AssetKind::Prefab => "Prefabs",
+        _ => "",
+    }
+}
+
+/// Copy files from anywhere on disk into the project (sorted by type). A `.gltf` brings its
+/// whole folder along (buffers/textures). Returns the project-relative paths.
+pub fn import(root: &Path, files: &[PathBuf]) -> Vec<Result<String, String>> {
+    files
+        .iter()
+        .map(|src| {
+            let kind = AssetKind::of(src);
+            let name = src
+                .file_name()
+                .ok_or("bad path")?
+                .to_string_lossy()
+                .to_string();
+            if kind == AssetKind::Folder {
+                return Err(format!("{name}: folders are not imported"));
+            }
+            let folder = folder_for(kind);
+            let is_gltf = name.to_lowercase().ends_with(".gltf");
+            if is_gltf {
+                // Copy sibling files (bin, textures) into Models/<stem>/.
+                let stem = src
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let dst_dir = root.join(folder).join(&stem);
+                copy_dir(src.parent().ok_or("bad path")?, &dst_dir, 2)
+                    .map_err(|e| e.to_string())?;
+                return Ok(format!("{folder}/{stem}/{name}"));
+            }
+            let dst = if folder.is_empty() {
+                root.join(&name)
+            } else {
+                root.join(folder).join(&name)
+            };
+            if let Some(d) = dst.parent() {
+                std::fs::create_dir_all(d).map_err(|e| e.to_string())?;
+            }
+            std::fs::copy(src, &dst).map_err(|e| format!("{name}: {e}"))?;
+            Ok(if folder.is_empty() {
+                name
+            } else {
+                format!("{folder}/{name}")
+            })
+        })
+        .collect()
+}
+
+fn copy_dir(src: &Path, dst: &Path, depth: u32) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for e in std::fs::read_dir(src)?.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if depth > 0 {
+                copy_dir(&p, &dst.join(e.file_name()), depth - 1)?;
+            }
+        } else if std::fs::metadata(&p)
+            .map(|m| m.len() < 512 << 20)
+            .unwrap_or(false)
+        {
+            std::fs::copy(&p, dst.join(e.file_name()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Make sure a project folder has the standard sub-folders and starter textures.
